@@ -132,15 +132,44 @@ vi.mock("@/components/ConfirmDialog", () => ({
     ) : null,
 }));
 
-vi.mock("@/components/AppSwitcher", () => ({
-  AppSwitcher: ({ activeApp, onSwitch }: any) => (
-    <div data-testid="app-switcher">
+vi.mock("@/components/sidebar/Sidebar", () => ({
+  Sidebar: ({
+    activeApp,
+    featureApp,
+    currentView,
+    onSelectView,
+    onSelectApp,
+    onOpenSettings,
+  }: any) => (
+    <div data-testid="sidebar">
       <span>{activeApp}</span>
-      <button onClick={() => onSwitch("claude")}>switch-claude</button>
-      <button onClick={() => onSwitch("codex")}>switch-codex</button>
-      <button onClick={() => onSwitch("openclaw")}>switch-openclaw</button>
+      <span data-testid="sidebar-feature-app">{featureApp}</span>
+      <span data-testid="sidebar-view">{currentView ?? "none"}</span>
+      <button onClick={() => onSelectApp("claude", "providers")}>
+        switch-claude
+      </button>
+      <button onClick={() => onSelectApp("codex", "providers")}>
+        switch-codex
+      </button>
+      <button onClick={() => onSelectApp("openclaw", "providers")}>
+        switch-openclaw
+      </button>
+      <button onClick={() => onSelectView("providers")}>nav-providers</button>
+      <button onClick={() => onSelectView("skills")}>nav-skills</button>
+      <button onClick={() => onSelectView("mcp")}>nav-mcp</button>
+      <button onClick={() => onOpenSettings()}>open-settings</button>
     </div>
   ),
+}));
+
+// 首页与 API 接入页与本文件的供应商用例无关，但会把 recharts / 用量面板整条
+// 依赖链拖进模块图，显著拖慢渲染。存根替代。
+vi.mock("@/components/home/HomePage", () => ({
+  HomePage: () => <div data-testid="home-page" />,
+}));
+
+vi.mock("@/components/apiAccess/ApiAccessPage", () => ({
+  ApiAccessPage: () => <div data-testid="api-access-page" />,
 }));
 
 vi.mock("@/components/skills/UnifiedSkillsPanel", async () => {
@@ -204,8 +233,10 @@ describe("App integration with MSW", () => {
     toastErrorMock.mockReset();
     skillsPanelMocks.checkUpdates.mockReset();
     skillsPanelMocks.openDiscovery.mockReset();
-    localStorage.removeItem("cc-switch-last-view");
     localStorage.removeItem("cc-switch-last-app");
+    // 应用默认视图是首页，而多数用例断言的是供应商列表。显式落一次视图，
+    // 让用例不依赖默认值——需要别的视图的用例自行覆盖这一项。
+    localStorage.setItem("cc-switch-last-view", "providers");
   });
 
   it("covers basic provider flows via real hooks", async () => {

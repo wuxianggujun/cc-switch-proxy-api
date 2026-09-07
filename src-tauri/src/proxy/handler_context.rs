@@ -3,16 +3,58 @@
 //! 提供请求生命周期的上下文管理，封装通用初始化逻辑
 
 use crate::app_config::AppType;
+use crate::database::UpstreamType;
 use crate::provider::Provider;
 use crate::proxy::{
     extract_session_id,
     forwarder::RequestForwarder,
+    gateway_route::candidate_to_provider,
     server::ProxyState,
     types::{AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, RectifierConfig},
     ProxyError,
 };
 use axum::http::HeaderMap;
 use std::time::Instant;
+
+/// app_type → 网关上游类型。
+///
+/// 只映射协议族确定的几个。`claude-desktop` 与 Claude 同协议但走独立命名空间
+/// 与鉴权，不并入；OAuth/托管账号类（OpenCode、OpenClaw、Hermes、Pi、GrokBuild）
+/// 是账号绑定语义，与 key 轮询天然冲突，一律不参与网关选线。
+fn gateway_upstream_for(app_type: &AppType) -> Option<UpstreamType> {
+    match app_type {
+        AppType::Claude => Some(UpstreamType::Claude),
+        AppType::Codex => Some(UpstreamType::Codex),
+        AppType::Gemini => Some(UpstreamType::Gemini),
+        _ => None,
+    }
+}
+
+/// 查网关候选并合成为 Provider 列表。
+///
+/// 返回空列表表示"网关没配相应线路"，调用方据此回落老链。查询失败也返回空——
+/// 网关是增量能力，它的故障不该让老链一起不可用。
+fn select_gateway_providers(
+    state: &ProxyState,
+    app_type: &AppType,
+    request_model: &str,
+) -> Vec<Provider> {
+    let Some(upstream) = gateway_upstream_for(app_type) else {
+        return Vec::new();
+    };
+
+    // request_model 在提取失败时是 "unknown"，那不是真实模型名。传 None 让
+    // 限定模型的接入点不参与，只用不限模型的线路兜底。
+    let model = (request_model != "unknown").then_some(request_model);
+
+    match state.db.select_route_candidates(upstream, model) {
+        Ok(candidates) => candidates.iter().map(candidate_to_provider).collect(),
+        Err(e) => {
+            log::warn!("[gateway] 选线查询失败，回落老链: {e}");
+            Vec::new()
+        }
+    }
+}
 
 /// 流式超时配置
 #[derive(Debug, Clone, Copy)]
@@ -129,19 +171,37 @@ impl RequestContext {
             session_result.client_provided
         );
 
-        // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
-        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
-            .provider_router
-            .select_providers(app_type_str)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
-                }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+        // 选线分叉：优先走新的 API 接入链（api_endpoints + api_keys）。
+        //
+        // 网关链配了线路就用它——它自带优先级分层与 LRU 轮询，且候选序列是
+        // per-request 构建的，降级不粘滞。没配则回落到老的 providers 表，
+        // 保持既有行为不变（用户要求双轨并存）。
+        let gateway_providers = select_gateway_providers(state, &app_type, &request_model);
+
+        let providers = if gateway_providers.is_empty() {
+            // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
+            // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
+            state
+                .provider_router
+                .select_providers(app_type_str)
+                .await
+                .map_err(|e| match e {
+                    crate::error::AppError::AllProvidersCircuitOpen => {
+                        ProxyError::AllProvidersCircuitOpen
+                    }
+                    crate::error::AppError::NoProvidersConfigured => {
+                        ProxyError::NoProvidersConfigured
+                    }
+                    _ => ProxyError::DatabaseError(e.to_string()),
+                })?
+        } else {
+            log::debug!(
+                "[{}] 网关选线命中 {} 条候选线路",
+                tag,
+                gateway_providers.len()
+            );
+            gateway_providers
+        };
 
         let provider = providers
             .first()

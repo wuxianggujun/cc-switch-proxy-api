@@ -29,6 +29,11 @@ pub struct ProviderRouter {
 }
 
 impl ProviderRouter {
+    /// 数据库句柄。网关链的记账需要它。
+    pub fn db(&self) -> &Arc<Database> {
+        &self.db
+    }
+
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
         Self {

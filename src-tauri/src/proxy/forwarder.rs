@@ -281,6 +281,67 @@ impl RequestForwarder {
         }
     }
 
+    /// 网关链成功记账。写 `last_used_at` 同时完成 LRU 轮询指针前移。
+    ///
+    /// 对老链 provider 是 no-op。token/cost 传 0：用量由 `proxy_request_logs`
+    /// 那条链统计，这里重复累加会双计。
+    fn record_gateway_success(&self, provider: &Provider) {
+        let Some(key_id) = super::gateway_route::gateway_key_id(provider) else {
+            return;
+        };
+        if let Err(e) = self.router.db().record_api_key_success(key_id, 0, 0.0) {
+            log::warn!("[gateway] 成功记账失败 key_id={key_id}: {e}");
+        }
+    }
+
+    /// 网关链失败判罚。把上游错误映射成冷却或硬状态。
+    ///
+    /// 对老链 provider 是 no-op。判罚独立于老链的 ErrorCategory：401 在老链是
+    /// Retryable，但对这把 key 意味着失效，必须踢出候选集。
+    fn record_gateway_failure(&self, provider: &Provider, error: &ProxyError) {
+        use crate::database::{classify_transport_failure, classify_upstream_status, KeyPenalty};
+
+        let Some(key_id) = super::gateway_route::gateway_key_id(provider) else {
+            return;
+        };
+
+        let penalty = match error {
+            ProxyError::UpstreamError { status, body } => {
+                // retry-after 头在 ProxyError 里没保留，只能靠状态码与 body 判定。
+                // 429 因此会走默认冷却而非上游给的精确值——可接受的降级。
+                classify_upstream_status(*status, body.as_deref(), None)
+            }
+            ProxyError::Timeout(_)
+            | ProxyError::ForwardFailed(_)
+            | ProxyError::StreamIdleTimeout(_) => classify_transport_failure(),
+            // 配置/转换错误是本地问题，罚 key 没有意义
+            ProxyError::ConfigError(_) | ProxyError::TransformError(_) => KeyPenalty::None,
+            ProxyError::AuthError(_) => {
+                classify_upstream_status(401, Some(&error.to_string()), None)
+            }
+            _ => KeyPenalty::None,
+        };
+
+        let (cooldown, hard_state) = match penalty {
+            KeyPenalty::None => return,
+            KeyPenalty::Cooldown(secs) => (Some(secs), None),
+            KeyPenalty::Hard(state) => (None, Some(state)),
+        };
+
+        if let Err(e) = self.router.db().record_api_key_failure(
+            key_id,
+            &error.to_string(),
+            cooldown,
+            hard_state,
+        ) {
+            log::warn!("[gateway] 失败记账失败 key_id={key_id}: {e}");
+        } else {
+            log::info!(
+                "[gateway] key_id={key_id} 判罚: cooldown={cooldown:?} hard_state={hard_state:?}"
+            );
+        }
+    }
+
     async fn record_success_result(
         &self,
         provider_id: &str,
@@ -544,6 +605,11 @@ impl RequestForwarder {
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
                         .await;
 
+                    // 网关链记账：写 last_used_at 同时完成 LRU 轮询指针前移，
+                    // 并清掉可能残留的冷却。token/cost 由用量链另行统计，这里传 0
+                    // 避免与 proxy_request_logs 重复计数。
+                    self.record_gateway_success(provider);
+
                     // 更新当前应用类型使用的 provider
                     {
                         let mut current_providers = self.current_providers.write().await;
@@ -558,8 +624,11 @@ impl RequestForwarder {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
+                        // 网关链的线路轮换是常态而非"供应商切换"：绝不能触发
+                        // try_switch —— 它会改写 DB 的 current provider、重建托盘、
+                        // 发 provider-switched 事件，导致 current 被反复改写、UI 抖动。
+                        let should_switch = !super::gateway_route::is_gateway_provider(provider)
+                            && self.current_provider_id_at_start.as_str() != provider.id.as_str();
                         if should_switch {
                             status.failover_count += 1;
 
@@ -1052,6 +1121,12 @@ impl RequestForwarder {
                     // —— NonRetryable / ClientAbort 是客户端层错误，无论换哪家 provider 都会被拒绝，
                     //    不应污染熔断器和数据库健康度（与 release_permit_neutral 同语义）。
                     let category = self.categorize_proxy_error(&e, provider);
+
+                    // 网关链判罚：与上面的 category 无关地独立判定。
+                    // 401 在老链是 Retryable（换一家可能有效），但对网关的**这把 key**
+                    // 意味着它失效了，必须标记 hard_state 踢出候选集；反之 400/422
+                    // 是调用方请求问题，即使老链认为可重试也不该罚 key。
+                    self.record_gateway_failure(provider, &e);
 
                     match category {
                         ErrorCategory::Retryable => {
@@ -2314,8 +2389,15 @@ impl RequestForwarder {
             self.non_streaming_timeout
         };
 
-        // 获取全局代理 URL
-        let upstream_proxy_url: Option<String> = super::http_client::get_current_proxy_url();
+        // 代理池优先：为当前 provider 选一个粘性绑定的出口节点。
+        // 池未启用/为空/全部熔断时返回 None，回退到全局代理（或直连）。
+        let pool_proxy_url: Option<String> = match crate::proxy_pool::global() {
+            Some(pool) => pool.select_proxy_url(&provider.id).await,
+            None => None,
+        };
+        let from_pool = pool_proxy_url.is_some();
+        let upstream_proxy_url: Option<String> =
+            pool_proxy_url.or_else(super::http_client::get_current_proxy_url);
 
         // SOCKS5 代理不支持 CONNECT 隧道，需要用 reqwest
         let is_socks_proxy = upstream_proxy_url
@@ -2337,7 +2419,18 @@ impl RequestForwarder {
             log::debug!(
                 "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
             );
-            let client = super::http_client::get();
+            // 池选出的节点必须用其专属 client —— 全局 client 的代理烧在构造里，
+            // 直接用它会让池选路被静默忽略（尤其 SOCKS5 只走这条路径）。
+            let client = match (from_pool, upstream_proxy_url.as_deref()) {
+                (true, Some(proxy_url)) => match super::http_client::client_for_proxy(proxy_url) {
+                    Ok(client) => client,
+                    Err(e) => {
+                        log::warn!("[Forwarder] 构建节点客户端失败，回退全局客户端: {e}");
+                        super::http_client::get()
+                    }
+                },
+                _ => super::http_client::get(),
+            };
             let mut request = client.request(method.clone(), &url);
             if request_is_streaming {
                 // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor

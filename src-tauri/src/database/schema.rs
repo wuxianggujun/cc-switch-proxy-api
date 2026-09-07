@@ -419,6 +419,12 @@ impl Database {
             "BOOLEAN NOT NULL DEFAULT 0",
         )?;
 
+        // 代理池表（订阅 / 节点 / 节点-订阅关联 / 粘性租约）
+        Self::create_proxy_pool_tables(conn)?;
+
+        // API 网关表（接入点 / 密钥 / 入站客户端凭据）
+        Self::create_api_gateway_tables(conn)?;
+
         // 删除旧的 failover_queue 表（如果存在）
         let _ = conn.execute("DROP INDEX IF EXISTS idx_failover_queue_order", []);
         let _ = conn.execute("DROP TABLE IF EXISTS failover_queue", []);
@@ -429,6 +435,177 @@ impl Database {
              ON providers(app_type, in_failover_queue, sort_index)",
             [],
         );
+
+        Ok(())
+    }
+
+    /// 建代理池相关表
+    ///
+    /// 节点与订阅是多对多：同一节点可能出现在多个订阅里（跨订阅去重），
+    /// 所以健康状态挂在 proxy_pool_nodes 上，关联关系单独一张表。
+    /// 节点凭据落库是必要的 —— 重启后要能直接重建代理 URL。
+    pub(crate) fn create_proxy_pool_tables(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS proxy_pool_subscriptions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source TEXT NOT NULL,
+                url TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                enabled BOOLEAN NOT NULL DEFAULT 1,
+                update_interval_secs INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                node_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+             );
+
+             CREATE TABLE IF NOT EXISTS proxy_pool_nodes (
+                hash TEXT PRIMARY KEY,
+                protocol TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                username TEXT,
+                password TEXT,
+                tag TEXT NOT NULL DEFAULT '',
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                circuit_open_since_ms INTEGER NOT NULL DEFAULT 0,
+                egress_ip TEXT,
+                latency_ewma_ms REAL,
+                last_probe_at_ms INTEGER NOT NULL DEFAULT 0
+             );
+
+             CREATE TABLE IF NOT EXISTS proxy_pool_node_subscriptions (
+                node_hash TEXT NOT NULL,
+                subscription_id TEXT NOT NULL,
+                PRIMARY KEY (node_hash, subscription_id),
+                FOREIGN KEY (node_hash) REFERENCES proxy_pool_nodes(hash) ON DELETE CASCADE,
+                FOREIGN KEY (subscription_id) REFERENCES proxy_pool_subscriptions(id) ON DELETE CASCADE
+             );
+
+             CREATE TABLE IF NOT EXISTS proxy_pool_leases (
+                sticky_key TEXT PRIMARY KEY,
+                node_hash TEXT NOT NULL,
+                egress_ip TEXT,
+                created_at_ms INTEGER NOT NULL,
+                last_used_at_ms INTEGER NOT NULL,
+                FOREIGN KEY (node_hash) REFERENCES proxy_pool_nodes(hash) ON DELETE CASCADE
+             );
+
+             CREATE INDEX IF NOT EXISTS idx_proxy_pool_node_subs_sub
+                ON proxy_pool_node_subscriptions(subscription_id);
+             CREATE INDEX IF NOT EXISTS idx_proxy_pool_nodes_egress
+                ON proxy_pool_nodes(egress_ip);",
+        )
+        .map_err(|e| AppError::Database(format!("创建代理池表失败: {e}")))?;
+        Ok(())
+    }
+
+    /// v18 → v19：新增代理池表
+    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+        Self::create_proxy_pool_tables(conn)
+    }
+
+    /// v19 → v20：新增 API 网关表（接入点 / 密钥 / 入站客户端凭据）
+    fn migrate_v19_to_v20(conn: &Connection) -> Result<(), AppError> {
+        Self::create_api_gateway_tables(conn)
+    }
+
+    /// API 网关表。
+    ///
+    /// 与既有 `providers` 表完全独立：`providers` 用于改写 CLI 配置文件指向某家
+    /// 供应商；这里是本地网关自己的路由表，一个接入点可挂多个密钥并按优先级轮询。
+    pub(crate) fn create_api_gateway_tables(conn: &Connection) -> Result<(), AppError> {
+        // 接入点：上游地址 + 支持的模型集合。priority 是层级优先级（越小越优先），
+        // 与 sort_index（纯展示序）解耦——这是老 failover 用 sort_index 兼任优先级
+        // 导致无法表达"同优先级"的根因。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS api_endpoints (
+                id            TEXT PRIMARY KEY,
+                name          TEXT NOT NULL,
+                upstream_type TEXT NOT NULL CHECK (upstream_type IN
+                              ('claude','openai','gemini','codex','deepseek')),
+                base_url      TEXT NOT NULL,
+                models        TEXT NOT NULL DEFAULT '[]',
+                priority      INTEGER NOT NULL DEFAULT 100,
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                sort_index    INTEGER,
+                notes         TEXT,
+                created_at    INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 api_endpoints 表失败: {e}")))?;
+
+        // 密钥：轮询发生在这一层。last_used_at 是 LRU 游标，状态即在表里，
+        // 重启不丢、无需内存计数器。cooldown_until 到期自动恢复；hard_state
+        // 需人工或额度重置信号才清除。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS api_keys (
+                id                 TEXT PRIMARY KEY,
+                endpoint_id        TEXT NOT NULL,
+                api_key            TEXT NOT NULL,
+                key_last4          TEXT NOT NULL,
+                name               TEXT,
+                internal_priority  INTEGER NOT NULL DEFAULT 50,
+                enabled            INTEGER NOT NULL DEFAULT 1,
+                last_used_at       INTEGER,
+                cooldown_until     INTEGER,
+                cooldown_reason    TEXT,
+                hard_state         TEXT,
+                request_count      INTEGER NOT NULL DEFAULT 0,
+                success_count      INTEGER NOT NULL DEFAULT 0,
+                error_count        INTEGER NOT NULL DEFAULT 0,
+                total_tokens       INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd     REAL NOT NULL DEFAULT 0,
+                last_error_at      INTEGER,
+                last_error_message TEXT,
+                created_at         INTEGER NOT NULL,
+                FOREIGN KEY (endpoint_id) REFERENCES api_endpoints(id) ON DELETE CASCADE
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 api_keys 表失败: {e}")))?;
+
+        // 入站客户端凭据。只存 SHA-256 摘要 + 末四位：明文仅创建时展示一次，
+        // 库泄漏也拿不到可用凭据。user_id 预留给将来的账号体系，当前恒为 NULL。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS client_keys (
+                id             TEXT PRIMARY KEY,
+                user_id        TEXT,
+                name           TEXT NOT NULL,
+                key_digest     TEXT NOT NULL UNIQUE,
+                key_last4      TEXT NOT NULL,
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                monthly_limit_usd REAL,
+                monthly_used_usd  REAL NOT NULL DEFAULT 0,
+                quota_reset_day   INTEGER,
+                rpm_limit      INTEGER,
+                request_count  INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0,
+                last_used_at   INTEGER,
+                revoked_at     INTEGER,
+                expires_at     INTEGER,
+                created_at     INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 client_keys 表失败: {e}")))?;
+
+        // 选线热路径索引：与 select_route_candidates 的 ORDER BY 前缀对齐
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_keys_rotation
+             ON api_keys(endpoint_id, internal_priority, last_used_at)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 api_keys 轮询索引失败: {e}")))?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_endpoints_routing
+             ON api_endpoints(upstream_type, enabled, priority)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 api_endpoints 选线索引失败: {e}")))?;
 
         Ok(())
     }
@@ -548,6 +725,16 @@ impl Database {
                         log::info!("迁移数据库从 v17 到 v18（会话日志字节游标列）");
                         Self::migrate_v17_to_v18(conn)?;
                         Self::set_user_version(conn, 18)?;
+                    }
+                    18 => {
+                        log::info!("迁移数据库从 v18 到 v19（代理池订阅/节点/租约表）");
+                        Self::migrate_v18_to_v19(conn)?;
+                        Self::set_user_version(conn, 19)?;
+                    }
+                    19 => {
+                        log::info!("迁移数据库从 v19 到 v20（API 网关接入点/密钥/客户端凭据表）");
+                        Self::migrate_v19_to_v20(conn)?;
+                        Self::set_user_version(conn, 20)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -3474,6 +3661,123 @@ mod tests {
              VALUES ('pi_session', 'request', 'semantic', 1)",
             [],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v18_to_v19_creates_proxy_pool_tables() -> Result<(), AppError> {
+        // 真实升级路径：v18 库没有任何代理池表，迁移后四张表就位且可写
+        let conn = Connection::open_in_memory()?;
+        Database::set_user_version(&conn, 18)?;
+        assert!(!Database::table_exists(&conn, "proxy_pool_subscriptions")?);
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for table in [
+            "proxy_pool_subscriptions",
+            "proxy_pool_nodes",
+            "proxy_pool_node_subscriptions",
+            "proxy_pool_leases",
+        ] {
+            assert!(
+                Database::table_exists(&conn, table)?,
+                "missing table {table}"
+            );
+        }
+
+        // 端到端写入：订阅 → 节点 → 关联 → 租约，验证列名与外键顺序无误
+        conn.execute(
+            "INSERT INTO proxy_pool_subscriptions
+             (id, name, source, url, content, enabled, update_interval_secs,
+              created_at_ms, updated_at_ms, node_count)
+             VALUES ('s1', 'sub', 'remote', 'https://e.com', '', 1, 3600, 1, 2, 0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO proxy_pool_nodes
+             (hash, protocol, host, port, username, password, tag)
+             VALUES ('abc123', 'socks5', '1.2.3.4', 1080, 'u', 'p', 'n1')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO proxy_pool_node_subscriptions (node_hash, subscription_id)
+             VALUES ('abc123', 's1')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO proxy_pool_leases
+             (sticky_key, node_hash, egress_ip, created_at_ms, last_used_at_ms)
+             VALUES ('provider-a', 'abc123', '9.9.9.9', 1, 2)",
+            [],
+        )?;
+
+        // 健康状态列有默认值，插入时未指定也能读出
+        let (failures, circuit): (i64, i64) = conn.query_row(
+            "SELECT failure_count, circuit_open_since_ms FROM proxy_pool_nodes WHERE hash = 'abc123'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(failures, 0);
+        assert_eq!(circuit, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v19_to_v20_creates_api_gateway_tables() -> Result<(), AppError> {
+        // 真实升级路径：v19 库没有网关表，迁移后三张表就位
+        let conn = Connection::open_in_memory()?;
+        Database::set_user_version(&conn, 19)?;
+        assert!(!Database::table_exists(&conn, "api_endpoints")?);
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for table in ["api_endpoints", "api_keys", "client_keys"] {
+            assert!(
+                Database::table_exists(&conn, table)?,
+                "missing table {table}"
+            );
+        }
+
+        conn.execute(
+            "INSERT INTO api_endpoints
+             (id, name, upstream_type, base_url, models, priority, enabled, sort_index, created_at)
+             VALUES ('ep1', 'relay', 'claude', 'https://r.example', '[\"claude-sonnet-4\"]', 10, 1, 0, 1)",
+            [],
+        )?;
+        // 同一接入点挂两个密钥——这是老 providers 表做不到的事
+        conn.execute(
+            "INSERT INTO api_keys (id, endpoint_id, api_key, key_last4, internal_priority, created_at)
+             VALUES ('k1', 'ep1', 'sk-aaaa1111', '1111', 50, 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO api_keys
+             (id, endpoint_id, api_key, key_last4, internal_priority, last_used_at, created_at)
+             VALUES ('k2', 'ep1', 'sk-bbbb2222', '2222', 50, 500, 1)",
+            [],
+        )?;
+
+        // LRU 排序：从未用过的 k1 必须排在用过的 k2 之前
+        let mut stmt = conn.prepare(
+            "SELECT k.id FROM api_keys k JOIN api_endpoints e ON k.endpoint_id = e.id
+             WHERE e.enabled = 1 AND k.enabled = 1 AND k.hard_state IS NULL
+             ORDER BY e.priority ASC, k.internal_priority ASC,
+                      k.last_used_at IS NOT NULL ASC, k.last_used_at ASC, k.id ASC",
+        )?;
+        let order: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(order, vec!["k1", "k2"], "从未使用的密钥应排最前");
+
+        // 外键级联：删接入点应带走其下密钥
+        conn.execute("PRAGMA foreign_keys = ON", [])?;
+        conn.execute("DELETE FROM api_endpoints WHERE id = 'ep1'", [])?;
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM api_keys", [], |row| row.get(0))?;
+        assert_eq!(remaining, 0, "删除接入点应级联删除其密钥");
+
         Ok(())
     }
 

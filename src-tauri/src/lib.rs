@@ -30,6 +30,7 @@ mod prompt;
 mod prompt_files;
 mod provider;
 mod proxy;
+mod proxy_pool;
 mod services;
 mod session_manager;
 mod settings;
@@ -1201,6 +1202,25 @@ pub fn run() {
                 }
             }
 
+            // 代理池：恢复节点与租约，按配置决定是否启动探测循环。
+            // 必须在全局代理客户端初始化之后 —— 拉取订阅会复用该客户端。
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app_handle.state::<AppState>();
+                    if let Err(e) = state.proxy_pool.load_from_db().await {
+                        log::error!("[ProxyPool] 恢复代理池失败: {e}");
+                        return;
+                    }
+                    // 注册全局实例，forwarder 在请求路径上通过它选路。
+                    // 必须在 load_from_db 之后 —— 否则首批请求会看到空池。
+                    crate::proxy_pool::init_global(state.proxy_pool.clone());
+                    if state.proxy_pool.get_config().await.enabled {
+                        state.proxy_pool.start_probe_loop().await;
+                    }
+                });
+            }
+
             // 异常退出恢复 + 代理状态自动恢复
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -1587,6 +1607,19 @@ pub fn run() {
             commands::remove_from_failover_queue,
             commands::get_auto_failover_enabled,
             commands::set_auto_failover_enabled,
+            // API gateway: endpoints & keys
+            commands::list_api_endpoints,
+            commands::create_api_endpoint,
+            commands::update_api_endpoint,
+            commands::delete_api_endpoint,
+            commands::reorder_api_endpoints,
+            commands::set_api_endpoint_enabled,
+            commands::list_api_keys,
+            commands::create_api_key,
+            commands::delete_api_key,
+            commands::set_api_key_enabled,
+            commands::clear_api_key_penalty,
+            commands::preview_route_candidates,
             // Usage statistics
             commands::get_usage_summary,
             commands::get_usage_summary_by_app,
@@ -1658,12 +1691,34 @@ pub fn run() {
             commands::set_hermes_memory,
             commands::get_hermes_memory_limits,
             commands::set_hermes_memory_enabled,
+            commands::get_checkin_config,
+            commands::upsert_checkin_site,
+            commands::delete_checkin_site,
+            commands::set_checkin_schedule,
+            commands::run_checkin_site,
+            commands::run_all_checkin_sites,
+            commands::refresh_checkin_clearance,
             // Global upstream proxy
             commands::get_global_proxy_url,
             commands::set_global_proxy_url,
             commands::test_proxy_url,
             commands::get_upstream_proxy_status,
             commands::scan_local_proxies,
+            // Proxy pool (subscriptions / nodes / sticky leases)
+            commands::pp_list_subscriptions,
+            commands::pp_add_subscription,
+            commands::pp_update_subscription,
+            commands::pp_delete_subscription,
+            commands::pp_refresh_subscription,
+            commands::pp_list_nodes,
+            commands::pp_get_stats,
+            commands::pp_get_config,
+            commands::pp_set_config,
+            commands::pp_probe_nodes,
+            commands::pp_reset_circuit,
+            commands::pp_list_leases,
+            commands::pp_clear_lease,
+            commands::pp_clear_all_leases,
             // Window theme control
             commands::set_window_theme,
             // Generic managed auth commands
@@ -1881,6 +1936,9 @@ pub fn run() {
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
+        // 停探测循环并落盘租约，避免下次启动丢失粘性绑定
+        state.proxy_pool.shutdown().await;
+
         let proxy_service = &state.proxy_service;
 
         // 退出时也需要兜底：代理可能已崩溃/未运行，但 Live 接管残留仍在（占位符/备份）。

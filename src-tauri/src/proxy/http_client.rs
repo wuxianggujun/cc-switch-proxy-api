@@ -196,6 +196,55 @@ pub fn get() -> Client {
         })
 }
 
+/// 按代理 URL 缓存的客户端池。
+///
+/// reqwest 的代理是 client 级配置，无法按请求切换，而代理池要为不同业务身份
+/// 选不同节点 —— 所以每个节点需要独立 client。复用连接池对性能是必要的：
+/// 每请求新建 client 会丢掉 keep-alive，等于每次重新 TLS 握手。
+static NODE_CLIENTS: OnceCell<RwLock<std::collections::HashMap<String, Client>>> = OnceCell::new();
+
+/// 缓存上限。超过则整体清空重建 —— 节点池规模通常在几百内，
+/// 触发这个上限说明节点在大量轮换，此时旧 client 已无价值。
+const MAX_CACHED_NODE_CLIENTS: usize = 512;
+
+/// 取（或创建）指定代理 URL 的专属客户端。
+///
+/// 用于代理池选路：调用方拿到节点的 proxy_url 后用这个函数取 client，
+/// 而不是用 `get()` 拿全局 client。
+pub fn client_for_proxy(proxy_url: &str) -> Result<Client, String> {
+    let cache = NODE_CLIENTS.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+
+    if let Ok(map) = cache.read() {
+        if let Some(client) = map.get(proxy_url) {
+            return Ok(client.clone());
+        }
+    }
+
+    let client = build_client(Some(proxy_url))?;
+
+    if let Ok(mut map) = cache.write() {
+        if map.len() >= MAX_CACHED_NODE_CLIENTS {
+            log::info!(
+                "[ProxyPool] 节点客户端缓存达上限 {MAX_CACHED_NODE_CLIENTS}，清空重建"
+            );
+            map.clear();
+        }
+        map.insert(proxy_url.to_string(), client.clone());
+    }
+
+    Ok(client)
+}
+
+/// 丢弃某个代理 URL 的缓存客户端。节点被移除或熔断时调用，
+/// 避免死连接留在池里。
+pub fn drop_cached_client(proxy_url: &str) {
+    if let Some(lock) = NODE_CLIENTS.get() {
+        if let Ok(mut map) = lock.write() {
+            map.remove(proxy_url);
+        }
+    }
+}
+
 /// 获取当前代理 URL
 ///
 /// 返回当前配置的代理 URL，None 表示直连。

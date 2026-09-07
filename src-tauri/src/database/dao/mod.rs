@@ -2,6 +2,9 @@
 //!
 //! Database access operations for each domain
 
+pub mod api_gateway;
+pub mod api_gateway_penalty;
+pub mod api_gateway_types;
 pub mod failover;
 pub mod mcp;
 pub mod profiles;
@@ -9,6 +12,7 @@ pub mod prompts;
 pub mod providers;
 pub mod providers_seed;
 pub mod proxy;
+pub mod proxy_pool;
 pub mod settings;
 pub mod skills;
 pub mod stream_check;

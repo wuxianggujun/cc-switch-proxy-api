@@ -40,6 +40,14 @@ pub(crate) use dao::proxy::{
     validate_cost_multiplier, validate_pricing_source, PRICING_SOURCE_REQUEST,
     PRICING_SOURCE_RESPONSE,
 };
+#[allow(unused_imports)]
+pub use dao::api_gateway_penalty::{
+    classify_transport_failure, classify_upstream_status, KeyPenalty,
+};
+pub use dao::api_gateway_types::{
+    ApiEndpointRecord, ApiKeyRecord, HardState, NewApiEndpoint, NewApiKey, RouteCandidate,
+    UpstreamType,
+};
 pub use dao::FailoverQueueItem;
 pub use dao::Profile;
 
@@ -53,7 +61,7 @@ use std::sync::Mutex;
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 18;
+pub(crate) const SCHEMA_VERSION: i32 = 20;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {

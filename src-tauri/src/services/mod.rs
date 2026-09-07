@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod checkin;
 pub mod codex_oauth_models;
 pub mod coding_plan;
 pub mod config;

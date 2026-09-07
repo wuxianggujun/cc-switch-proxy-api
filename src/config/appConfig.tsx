@@ -28,6 +28,19 @@ export const APP_IDS: AppId[] = [
   "pi",
 ];
 
+/** ProviderIcon 的图标名（codex 复用 openai 图标）。 */
+export const APP_ICON_NAME: Record<AppId, string> = {
+  claude: "claude",
+  "claude-desktop": "claude",
+  codex: "openai",
+  gemini: "gemini",
+  grokbuild: "grok",
+  opencode: "opencode",
+  openclaw: "openclaw",
+  hermes: "hermes",
+  pi: "pi",
+};
+
 export const DEFAULT_VISIBLE_APPS: VisibleApps = {
   claude: true,
   "claude-desktop": true,
