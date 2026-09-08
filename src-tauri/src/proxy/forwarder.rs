@@ -188,6 +188,9 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// Per-request header metadata for gateway accounting; keep ProxyError's
+    /// established public shape unchanged for the legacy adapters.
+    gateway_retry_after: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl RequestForwarder {
@@ -278,19 +281,32 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            gateway_retry_after: Default::default(),
         }
     }
 
-    /// 网关链成功记账。写 `last_used_at` 同时完成 LRU 轮询指针前移。
-    ///
-    /// 对老链 provider 是 no-op。token/cost 传 0：用量由 `proxy_request_logs`
-    /// 那条链统计，这里重复累加会双计。
-    fn record_gateway_success(&self, provider: &Provider) {
-        let Some(key_id) = super::gateway_route::gateway_key_id(provider) else {
+    fn should_switch_current(&self, provider: &Provider) -> bool {
+        !super::gateway_route::is_gateway_provider(provider)
+            && self.current_provider_id_at_start != provider.id
+    }
+
+    fn remember_gateway_retry_after(&self, provider: &Provider, headers: &http::HeaderMap) {
+        if !super::gateway_route::is_gateway_provider(provider) {
             return;
-        };
-        if let Err(e) = self.router.db().record_api_key_success(key_id, 0, 0.0) {
-            log::warn!("[gateway] 成功记账失败 key_id={key_id}: {e}");
+        }
+        match self.gateway_retry_after.lock() {
+            Ok(mut values) => {
+                values.remove(&provider.id);
+                if let Some(value) = headers
+                    .get(http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    if value.len() <= 64 {
+                        values.insert(provider.id.clone(), value.into());
+                    }
+                }
+            }
+            Err(error) => log::warn!("[gateway] 无法记录 Retry-After: {error}"),
         }
     }
 
@@ -304,36 +320,50 @@ impl RequestForwarder {
         let Some(key_id) = super::gateway_route::gateway_key_id(provider) else {
             return;
         };
+        let retry_after = self
+            .gateway_retry_after
+            .lock()
+            .map(|values| values.get(&provider.id).cloned())
+            .unwrap_or_else(|error| {
+                log::warn!("[gateway] 无法读取 Retry-After: {error}");
+                None
+            });
 
         let penalty = match error {
             ProxyError::UpstreamError { status, body } => {
-                // retry-after 头在 ProxyError 里没保留，只能靠状态码与 body 判定。
-                // 429 因此会走默认冷却而非上游给的精确值——可接受的降级。
-                classify_upstream_status(*status, body.as_deref(), None)
+                classify_upstream_status(*status, body.as_deref(), retry_after.as_deref())
             }
             ProxyError::Timeout(_)
             | ProxyError::ForwardFailed(_)
             | ProxyError::StreamIdleTimeout(_) => classify_transport_failure(),
             // 配置/转换错误是本地问题，罚 key 没有意义
             ProxyError::ConfigError(_) | ProxyError::TransformError(_) => KeyPenalty::None,
-            ProxyError::AuthError(_) => {
-                classify_upstream_status(401, Some(&error.to_string()), None)
-            }
+            ProxyError::AuthError(_) => KeyPenalty::Hard(crate::database::HardState::AuthInvalid),
             _ => KeyPenalty::None,
         };
 
         let (cooldown, hard_state) = match penalty {
-            KeyPenalty::None => return,
+            KeyPenalty::None => (None, None),
             KeyPenalty::Cooldown(secs) => (Some(secs), None),
             KeyPenalty::Hard(state) => (None, Some(state)),
         };
 
-        if let Err(e) = self.router.db().record_api_key_failure(
-            key_id,
-            &error.to_string(),
-            cooldown,
-            hard_state,
-        ) {
+        let mut message = error.to_string();
+        if let Some(secret) = provider
+            .settings_config
+            .get("api_key")
+            .and_then(Value::as_str)
+        {
+            if !secret.is_empty() {
+                message = message.replace(secret, "[REDACTED]");
+            }
+        }
+        let message: String = message.chars().take(512).collect();
+        if let Err(e) = self
+            .router
+            .db()
+            .record_api_key_failure(key_id, &message, cooldown, hard_state)
+        {
             log::warn!("[gateway] 失败记账失败 key_id={key_id}: {e}");
         } else {
             log::info!(
@@ -348,6 +378,16 @@ impl RequestForwarder {
         app_type: &str,
         used_half_open_permit: bool,
     ) {
+        if let Some(key_id) =
+            provider_id.strip_prefix(super::gateway_route::GATEWAY_PROVIDER_PREFIX)
+        {
+            // Shared by normal, media, signature and budget retry success paths.
+            // Synthetic providers have no row in providers/provider_health.
+            if let Err(error) = self.router.db().record_api_key_success(key_id, 0, 0.0) {
+                log::warn!("[gateway] 成功记账失败 key_id={key_id}: {error}");
+            }
+            return;
+        }
         if used_half_open_permit {
             if let Err(e) = self
                 .router
@@ -376,6 +416,31 @@ impl RequestForwarder {
         });
     }
 
+    async fn record_legacy_failure(
+        &self,
+        provider: &Provider,
+        app_type: &str,
+        used_half_open_permit: bool,
+        error: &ProxyError,
+    ) {
+        if super::gateway_route::is_gateway_provider(provider) {
+            return;
+        }
+        if let Err(record_error) = self
+            .router
+            .record_result(
+                &provider.id,
+                app_type,
+                used_half_open_permit,
+                false,
+                Some(error.to_string()),
+            )
+            .await
+        {
+            log::warn!("[{app_type}] 记录供应商失败结果失败: {record_error}");
+        }
+    }
+
     /// 整流（thinking signature 或 budget）重试失败后的统一收尾。
     ///
     /// `None` 表示已记录熔断器、累积 `last_error`/`last_provider`，
@@ -395,22 +460,19 @@ impl RequestForwarder {
     ) -> Option<ForwardError> {
         // Provider 错误：本家上游/网络确实出问题，下一家 provider 可能可用 → 继续故障转移。
         // 客户端错误：整流后请求仍违法，下一家也修不好 → 直接返回。
+        self.record_gateway_failure(provider, &retry_err);
         let is_provider_error = match &retry_err {
             ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => true,
-            ProxyError::UpstreamError { status, .. } => *status >= 500,
+            ProxyError::UpstreamError { status, .. } => {
+                *status >= 500
+                    || (super::gateway_route::is_gateway_provider(provider)
+                        && matches!(status, 401 | 402 | 403 | 429))
+            }
             _ => false,
         };
 
         if is_provider_error {
-            let _ = self
-                .router
-                .record_result(
-                    &provider.id,
-                    app_type_str,
-                    used_half_open_permit,
-                    false,
-                    Some(retry_err.to_string()),
-                )
+            self.record_legacy_failure(provider, app_type_str, used_half_open_permit, &retry_err)
                 .await;
             {
                 let mut status = self.status.write().await;
@@ -542,15 +604,16 @@ impl RequestForwarder {
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
             // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
-            let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, false)
-            } else {
-                let permit = self
-                    .router
-                    .allow_provider_request(&provider.id, app_type_str)
-                    .await;
-                (permit.allowed, permit.used_half_open_permit)
-            };
+            let (allowed, used_half_open_permit) =
+                if bypass_circuit_breaker || super::gateway_route::is_gateway_provider(provider) {
+                    (true, false)
+                } else {
+                    let permit = self
+                        .router
+                        .allow_provider_request(&provider.id, app_type_str)
+                        .await;
+                    (permit.allowed, permit.used_half_open_permit)
+                };
 
             if !allowed {
                 continue;
@@ -605,11 +668,6 @@ impl RequestForwarder {
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
                         .await;
 
-                    // 网关链记账：写 last_used_at 同时完成 LRU 轮询指针前移，
-                    // 并清掉可能残留的冷却。token/cost 由用量链另行统计，这里传 0
-                    // 避免与 proxy_request_logs 重复计数。
-                    self.record_gateway_success(provider);
-
                     // 更新当前应用类型使用的 provider
                     {
                         let mut current_providers = self.current_providers.write().await;
@@ -627,8 +685,7 @@ impl RequestForwarder {
                         // 网关链的线路轮换是常态而非"供应商切换"：绝不能触发
                         // try_switch —— 它会改写 DB 的 current provider、重建托盘、
                         // 发 provider-switched 事件，导致 current 被反复改写、UI 抖动。
-                        let should_switch = !super::gateway_route::is_gateway_provider(provider)
-                            && self.current_provider_id_at_start.as_str() != provider.id.as_str();
+                        let should_switch = self.should_switch_current(provider);
                         if should_switch {
                             status.failover_count += 1;
 
@@ -730,9 +787,7 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
+                                        let should_switch = self.should_switch_current(provider);
                                         if should_switch {
                                             status.failover_count += 1;
                                             let fm = self.failover_manager.clone();
@@ -877,8 +932,7 @@ impl RequestForwarder {
                                             status.success_requests += 1;
                                             status.last_error = None;
                                             let should_switch =
-                                                self.current_provider_id_at_start.as_str()
-                                                    != provider.id.as_str();
+                                                self.should_switch_current(provider);
                                             if should_switch {
                                                 status.failover_count += 1;
 
@@ -1040,9 +1094,7 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
+                                        let should_switch = self.should_switch_current(provider);
                                         if should_switch {
                                             status.failover_count += 1;
                                             let fm = self.failover_manager.clone();
@@ -1131,16 +1183,13 @@ impl RequestForwarder {
                     match category {
                         ErrorCategory::Retryable => {
                             // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
-                            let _ = self
-                                .router
-                                .record_result(
-                                    &provider.id,
-                                    app_type_str,
-                                    used_half_open_permit,
-                                    false,
-                                    Some(e.to_string()),
-                                )
-                                .await;
+                            self.record_legacy_failure(
+                                provider,
+                                app_type_str,
+                                used_half_open_permit,
+                                &e,
+                            )
+                            .await;
 
                             {
                                 let mut status = self.status.write().await;
@@ -2412,7 +2461,10 @@ impl RequestForwarder {
             is_copilot,
         );
 
-        // 发送请求
+        // A 401/429 still proves the exit node worked; only transport errors and
+        // proxy authentication failures should trip the node circuit.
+        let transport_started = std::time::Instant::now();
+        let transport_result: Result<ProxyResponse, ProxyError> = async {
         let response = if is_socks_proxy || !preserve_exact_header_case {
             // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
             // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
@@ -2422,13 +2474,8 @@ impl RequestForwarder {
             // 池选出的节点必须用其专属 client —— 全局 client 的代理烧在构造里，
             // 直接用它会让池选路被静默忽略（尤其 SOCKS5 只走这条路径）。
             let client = match (from_pool, upstream_proxy_url.as_deref()) {
-                (true, Some(proxy_url)) => match super::http_client::client_for_proxy(proxy_url) {
-                    Ok(client) => client,
-                    Err(e) => {
-                        log::warn!("[Forwarder] 构建节点客户端失败，回退全局客户端: {e}");
-                        super::http_client::get()
-                    }
-                },
+                (true, Some(proxy_url)) => super::http_client::client_for_proxy(proxy_url)
+                    .map_err(|_| ProxyError::ConfigError("创建代理池节点客户端失败".into()))?,
                 _ => super::http_client::get(),
             };
             let mut request = client.request(method.clone(), &url);
@@ -2480,6 +2527,25 @@ impl RequestForwarder {
             )
             .await?
         };
+        Ok(response)
+        }.await;
+
+        if from_pool {
+            if let (Some(pool), Some(proxy_url)) =
+                (crate::proxy_pool::global(), upstream_proxy_url.as_deref())
+            {
+                let connected = transport_result
+                    .as_ref()
+                    .is_ok_and(|response| response.status().as_u16() != 407);
+                pool.record_result(
+                    proxy_url,
+                    connected,
+                    connected.then(|| transport_started.elapsed().as_secs_f64() * 1000.0),
+                )
+                .await;
+            }
+        }
+        let response = transport_result?;
 
         // 检查响应状态
         let status = response.status();
@@ -2515,6 +2581,7 @@ impl RequestForwarder {
             Ok((response, resolved_claude_api_format, outbound_model))
         } else {
             let status_code = status.as_u16();
+            self.remember_gateway_retry_after(provider, response.headers());
             // 错误响应同样可能被上游压缩（content-encoding）。reqwest 未启用任何
             // 自动解压 feature，这里拿到的是原始字节；不解压的话，压缩过的错误体会
             // 在 from_utf8 处变成非 UTF-8 而被丢弃，隐藏掉上游的限流/鉴权等详情。
@@ -3894,6 +3961,7 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            gateway_retry_after: Default::default(),
         }
     }
 

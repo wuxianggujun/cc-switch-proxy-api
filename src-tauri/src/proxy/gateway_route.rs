@@ -62,6 +62,12 @@ pub fn candidate_to_provider(candidate: &RouteCandidate) -> Provider {
         "env": env,
         "base_url": base_url,
         "api_key": key,
+        "api_format": match candidate.upstream_type {
+            UpstreamType::Claude => "anthropic",
+            UpstreamType::Openai | UpstreamType::Deepseek => "openai_chat",
+            UpstreamType::Codex => "openai_responses",
+            UpstreamType::Gemini => "gemini_native",
+        },
     });
 
     Provider {
@@ -147,12 +153,7 @@ mod tests {
         assert_eq!(gateway_key_id(&provider), Some("key_abc"));
 
         // 老链的 provider 不该被误判
-        let legacy = Provider::with_id(
-            "abc123".to_string(),
-            "Legacy".to_string(),
-            json!({}),
-            None,
-        );
+        let legacy = Provider::with_id("abc123".to_string(), "Legacy".to_string(), json!({}), None);
         assert!(!is_gateway_provider(&legacy));
         assert_eq!(gateway_key_id(&legacy), None);
     }

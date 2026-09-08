@@ -14,6 +14,9 @@ export function useCheckinConfig() {
   return useQuery({
     queryKey: checkinKeys.config,
     queryFn: () => checkinApi.getConfig(),
+    // Scheduling lives in Rust; refresh results while the panel is open without
+    // relying on the page itself to keep the daily task alive.
+    refetchInterval: 30_000,
   });
 }
 

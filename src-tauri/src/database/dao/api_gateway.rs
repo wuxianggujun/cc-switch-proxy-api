@@ -2,11 +2,10 @@
 //!
 //! 接入点与密钥的增删改查 + 选线查询。
 //!
-//! 轮询不用内存计数器，靠 `api_keys.last_used_at` 做 LRU 排序：状态就在表里，
-//! 重启不丢，无需锁。并发下两个请求可能拿到同一个 key，这是可接受的——
-//! 真正的限流由上游和冷却机制兜底。
+//! `api_keys.last_used_at` 持久化 LRU 顺序；请求选线与预占在连接锁内完成，
+//! 避免秒级时间戳并列、在途请求尚未记账时重复选择首 key。预览不修改顺序。
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +21,40 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A persisted millisecond ordering marker, strictly increasing even when several
+/// requests arrive within the same clock tick or the system clock moves back.
+fn next_route_timestamp(conn: &Connection) -> Result<i64, AppError> {
+    let previous: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(last_used_at), 0) FROM api_keys",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(now.max(previous.saturating_add(1)))
+}
+
+fn validate_endpoint_url(raw: &str) -> Result<(), AppError> {
+    let url =
+        url::Url::parse(raw).map_err(|_| AppError::Config("接入点地址不是有效的 URL".into()))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(AppError::Config(
+            "接入点必须使用无凭据、查询参数和片段的 HTTP(S) 基础地址".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 生成 ID。时间戳纳秒 + 进程内计数器取 sha256 前缀，避免同秒碰撞。
@@ -123,6 +156,7 @@ impl Database {
         if base_url.is_empty() {
             return Err(AppError::Config("接入点地址不能为空".into()));
         }
+        validate_endpoint_url(base_url)?;
 
         let conn = lock_conn!(self.conn);
         let id = new_id("ep");
@@ -168,6 +202,7 @@ impl Database {
         if base_url.is_empty() {
             return Err(AppError::Config("接入点地址不能为空".into()));
         }
+        validate_endpoint_url(base_url)?;
 
         let conn = lock_conn!(self.conn);
         let models = serde_json::to_string(&record.models)
@@ -186,7 +221,11 @@ impl Database {
                     models,
                     record.priority,
                     if record.enabled { 1 } else { 0 },
-                    record.notes.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                    record
+                        .notes
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty()),
                     record.id,
                 ],
             )
@@ -293,7 +332,11 @@ impl Database {
                 input.endpoint_id,
                 api_key,
                 last4(api_key),
-                input.name.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                input
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
                 input.internal_priority,
                 now_secs(),
             ],
@@ -351,53 +394,41 @@ impl Database {
         model: Option<&str>,
     ) -> Result<Vec<RouteCandidate>, AppError> {
         let conn = lock_conn!(self.conn);
-        let now = now_secs();
+        query_route_candidates(&conn, &[upstream], model)
+    }
 
-        // models 为空数组表示不限模型；否则要求 model 在数组内命中
-        let mut stmt = conn
-            .prepare(
-                "SELECT k.id AS key_id, k.api_key, k.key_last4, k.internal_priority, k.last_used_at,
-                        e.id AS endpoint_id, e.name AS endpoint_name, e.base_url, e.priority
-                 FROM api_keys k
-                 JOIN api_endpoints e ON k.endpoint_id = e.id
-                 WHERE e.enabled = 1
-                   AND k.enabled = 1
-                   AND k.hard_state IS NULL
-                   AND (k.cooldown_until IS NULL OR k.cooldown_until < ?1)
-                   AND e.upstream_type = ?2
-                   AND (
-                     ?3 IS NULL
-                     OR json_array_length(e.models) = 0
-                     OR EXISTS (SELECT 1 FROM json_each(e.models) WHERE value = ?3)
-                   )
-                 ORDER BY e.priority ASC,
-                          k.internal_priority ASC,
-                          k.last_used_at IS NOT NULL ASC,
-                          k.last_used_at ASC,
-                          k.id ASC",
+    /// None: no enabled gateway is configured, so legacy routing is allowed.
+    /// Some(empty): configured gateway has no eligible key/model; fail closed.
+    /// Selection and reservation share the connection lock, before any network I/O.
+    pub fn reserve_route_candidates(
+        &self,
+        upstreams: &[UpstreamType],
+        model: Option<&str>,
+    ) -> Result<Option<Vec<RouteCandidate>>, AppError> {
+        let conn = lock_conn!(self.conn);
+        let upstream_json =
+            serde_json::to_string(upstreams).map_err(|e| AppError::Config(e.to_string()))?;
+        let configured: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM api_endpoints WHERE enabled = 1
+             AND upstream_type IN (SELECT value FROM json_each(?1)))",
+                [upstream_json],
+                |row| row.get(0),
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let items = stmt
-            .query_map(params![now, upstream.as_str(), model], |row| {
-                Ok(RouteCandidate {
-                    key_id: row.get("key_id")?,
-                    endpoint_id: row.get("endpoint_id")?,
-                    endpoint_name: row.get("endpoint_name")?,
-                    base_url: row.get("base_url")?,
-                    upstream_type: upstream,
-                    key_last4: row.get("key_last4")?,
-                    priority: row.get("priority")?,
-                    internal_priority: row.get("internal_priority")?,
-                    last_used_at: row.get("last_used_at")?,
-                    api_key: row.get("api_key")?,
-                })
-            })
-            .map_err(|e| AppError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
+        if !configured {
+            return Ok(None);
+        }
+        let candidates = query_route_candidates(&conn, upstreams, model)?;
+        if let Some(first) = candidates.first() {
+            let timestamp = next_route_timestamp(&conn)?;
+            conn.execute(
+                "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
+                params![timestamp, first.key_id],
+            )
             .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(items)
+        }
+        Ok(Some(candidates))
     }
 
     /// 记账成功。写 last_used_at 同时完成轮询指针前移。
@@ -408,17 +439,16 @@ impl Database {
         cost_usd: f64,
     ) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
+        let timestamp = next_route_timestamp(&conn)?;
         conn.execute(
             "UPDATE api_keys
              SET last_used_at = ?1,
                  request_count = request_count + 1,
                  success_count = success_count + 1,
                  total_tokens = total_tokens + ?2,
-                 total_cost_usd = total_cost_usd + ?3,
-                 cooldown_until = NULL,
-                 cooldown_reason = NULL
+                 total_cost_usd = total_cost_usd + ?3
              WHERE id = ?4",
-            params![now_secs(), tokens, cost_usd, key_id],
+            params![timestamp, tokens, cost_usd, key_id],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
@@ -435,30 +465,73 @@ impl Database {
     ) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
         let now = now_secs();
+        let timestamp = next_route_timestamp(&conn)?;
 
         conn.execute(
             "UPDATE api_keys
              SET last_used_at = ?1,
                  request_count = request_count + 1,
                  error_count = error_count + 1,
-                 last_error_at = ?1,
+                 last_error_at = ?7,
                  last_error_message = ?2,
-                 cooldown_until = ?3,
-                 cooldown_reason = ?4,
-                 hard_state = ?5
+                 cooldown_until = CASE WHEN hard_state IS NOT NULL OR ?5 IS NOT NULL THEN NULL
+                    WHEN ?3 IS NULL THEN cooldown_until ELSE MAX(COALESCE(cooldown_until, 0), ?3) END,
+                 cooldown_reason = COALESCE(?4, cooldown_reason),
+                 hard_state = COALESCE(hard_state, ?5)
              WHERE id = ?6",
             params![
-                now,
+                timestamp,
                 message,
                 cooldown_secs.map(|secs| now + secs),
                 cooldown_secs.map(|_| message),
                 hard_state.map(|s| s.as_str()),
                 key_id,
+                now,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
+}
+
+fn query_route_candidates(
+    conn: &Connection,
+    upstreams: &[UpstreamType],
+    model: Option<&str>,
+) -> Result<Vec<RouteCandidate>, AppError> {
+    let upstream_json =
+        serde_json::to_string(upstreams).map_err(|e| AppError::Config(e.to_string()))?;
+    let mut stmt = conn.prepare(
+        "SELECT k.id AS key_id, k.api_key, k.key_last4, k.internal_priority, k.last_used_at,
+                e.id AS endpoint_id, e.name AS endpoint_name, e.base_url, e.priority, e.upstream_type
+         FROM api_keys k JOIN api_endpoints e ON k.endpoint_id = e.id
+         WHERE e.enabled = 1 AND k.enabled = 1 AND k.hard_state IS NULL
+           AND (k.cooldown_until IS NULL OR k.cooldown_until <= ?1)
+           AND e.upstream_type IN (SELECT value FROM json_each(?2))
+           AND (?3 IS NULL OR json_array_length(e.models) = 0
+                OR EXISTS (SELECT 1 FROM json_each(e.models) WHERE value = ?3))
+         ORDER BY e.priority ASC, k.internal_priority ASC,
+                  k.last_used_at IS NOT NULL ASC, k.last_used_at ASC, k.id ASC"
+    ).map_err(|e| AppError::Database(e.to_string()))?;
+    let rows = stmt
+        .query_map(params![now_secs(), upstream_json, model], |row| {
+            let raw: String = row.get("upstream_type")?;
+            Ok(RouteCandidate {
+                key_id: row.get("key_id")?,
+                endpoint_id: row.get("endpoint_id")?,
+                endpoint_name: row.get("endpoint_name")?,
+                base_url: row.get("base_url")?,
+                upstream_type: UpstreamType::parse(&raw).ok_or(rusqlite::Error::InvalidQuery)?,
+                key_last4: row.get("key_last4")?,
+                priority: row.get("priority")?,
+                internal_priority: row.get("internal_priority")?,
+                last_used_at: row.get("last_used_at")?,
+                api_key: row.get("api_key")?,
+            })
+        })
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| AppError::Database(e.to_string()))
 }
 
 #[cfg(test)]
@@ -504,6 +577,102 @@ mod tests {
             key_id,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn readiness_fast_requests_rotate_without_timestamp_ties() {
+        let db = Database::memory().unwrap();
+        let ep = endpoint(&db, "rotate", UpstreamType::Claude, 100);
+        key(&db, &ep, "sk-first", 50);
+        key(&db, &ep, "sk-second", 50);
+        let mut previous = None;
+        for _ in 0..12 {
+            let selected = db
+                .select_route_candidates(UpstreamType::Claude, None)
+                .unwrap();
+            let current = selected[0].key_id.clone();
+            assert_ne!(previous.as_ref(), Some(&current));
+            db.record_api_key_success(&current, 0, 0.0).unwrap();
+            previous = Some(current);
+        }
+    }
+
+    #[test]
+    fn reservation_rotates_before_requests_finish_but_preview_is_read_only() {
+        let db = Database::memory().unwrap();
+        let ep = endpoint(&db, "reserve", UpstreamType::Claude, 100);
+        key(&db, &ep, "sk-a", 50);
+        key(&db, &ep, "sk-b", 50);
+        let preview = db
+            .select_route_candidates(UpstreamType::Claude, None)
+            .unwrap();
+        let again = db
+            .select_route_candidates(UpstreamType::Claude, None)
+            .unwrap();
+        assert_eq!(preview[0].key_id, again[0].key_id);
+        let first = db
+            .reserve_route_candidates(&[UpstreamType::Claude], Some("test"))
+            .unwrap()
+            .unwrap();
+        let second = db
+            .reserve_route_candidates(&[UpstreamType::Claude], Some("test"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(first[0].key_id, second[0].key_id);
+        assert!(db
+            .list_api_keys(&ep)
+            .unwrap()
+            .iter()
+            .all(|key| key.request_count == 0));
+    }
+
+    #[test]
+    fn late_success_does_not_undo_a_concurrent_cooldown() {
+        let db = Database::memory().unwrap();
+        let ep = endpoint(&db, "cooldown", UpstreamType::Claude, 100);
+        let id = key(&db, &ep, "sk-a", 50);
+        db.record_api_key_failure(&id, "rate limit", Some(60), None)
+            .unwrap();
+        db.record_api_key_success(&id, 0, 0.0).unwrap();
+        assert!(db
+            .select_route_candidates(UpstreamType::Claude, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn gateway_reservation_distinguishes_unconfigured_from_unavailable() {
+        let db = Database::memory().unwrap();
+        assert!(db
+            .reserve_route_candidates(&[UpstreamType::Claude], None)
+            .unwrap()
+            .is_none());
+        let ep = endpoint(&db, "empty", UpstreamType::Claude, 100);
+        assert!(db
+            .reserve_route_candidates(&[UpstreamType::Claude], None)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        db.set_api_endpoint_enabled(&ep, false).unwrap();
+        assert!(db
+            .reserve_route_candidates(&[UpstreamType::Claude], None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn readiness_transient_failure_cannot_clear_hard_penalty() {
+        let db = Database::memory().unwrap();
+        let ep = endpoint(&db, "penalty", UpstreamType::Claude, 100);
+        let id = key(&db, &ep, "sk-test", 50);
+        db.record_api_key_failure(&id, "invalid", None, Some(HardState::AuthInvalid))
+            .unwrap();
+        db.record_api_key_failure(&id, "late timeout", Some(60), None)
+            .unwrap();
+        assert_eq!(
+            db.list_api_keys(&ep).unwrap()[0].hard_state,
+            Some(HardState::AuthInvalid)
+        );
     }
 
     #[test]

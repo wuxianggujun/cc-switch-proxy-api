@@ -9,7 +9,9 @@ import {
 } from "@/types/apiGateway";
 
 /** 各上游类型的接入数量。未出现的类型计 0。 */
-function countByUpstream(endpoints: ApiEndpoint[]): Record<UpstreamType, number> {
+function countByUpstream(
+  endpoints: ApiEndpoint[],
+): Record<UpstreamType, number> {
   const counts = {} as Record<UpstreamType, number>;
   for (const type of UPSTREAM_ORDER) {
     counts[type] = 0;

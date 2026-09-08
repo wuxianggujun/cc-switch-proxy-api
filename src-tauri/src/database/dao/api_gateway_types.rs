@@ -127,7 +127,8 @@ pub struct ApiKeyRecord {
     /// 层内优先级，越小越优先。
     pub internal_priority: i64,
     pub enabled: bool,
-    /// LRU 轮询依据。NULL 表示从未使用，排最前。
+    /// LRU 轮询依据（单调递增的 Unix 毫秒标记）。旧秒值首次使用后自动升级。
+    /// NULL 表示从未使用，排最前。
     pub last_used_at: Option<i64>,
     pub cooldown_until: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]

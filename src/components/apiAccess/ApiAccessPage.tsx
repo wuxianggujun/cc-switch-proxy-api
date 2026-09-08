@@ -39,8 +39,12 @@ import {
   type UpstreamType,
 } from "@/types/apiGateway";
 import { UpstreamColumn } from "./UpstreamColumn";
+import { GatewayStatusBar } from "./GatewayStatusBar";
 import { EndpointRow } from "./EndpointRow";
-import { EndpointFormModal, type EndpointFormValues } from "./EndpointFormModal";
+import {
+  EndpointFormModal,
+  type EndpointFormValues,
+} from "./EndpointFormModal";
 import { KeyFormModal, type KeyFormValues } from "./KeyFormModal";
 
 export function ApiAccessPage() {
@@ -57,8 +61,12 @@ export function ApiAccessPage() {
   const [deleteTarget, setDeleteTarget] = useState<ApiEndpoint | null>(null);
   const [deleteKeyTarget, setDeleteKeyTarget] = useState<ApiKey | null>(null);
 
-  const { data: endpoints = [], isLoading, refetch, isFetching } =
-    useApiEndpoints();
+  const {
+    data: endpoints = [],
+    isLoading,
+    refetch,
+    isFetching,
+  } = useApiEndpoints();
   const { data: expandedKeys } = useApiKeys(expandedId ?? undefined);
 
   const createEndpoint = useCreateApiEndpoint();
@@ -199,7 +207,9 @@ export function ApiAccessPage() {
             disabled={isFetching}
           >
             <RefreshCw
-              className={isFetching ? "mr-2 h-4 w-4 animate-spin" : "mr-2 h-4 w-4"}
+              className={
+                isFetching ? "mr-2 h-4 w-4 animate-spin" : "mr-2 h-4 w-4"
+              }
             />
             {t("apiAccess.refresh")}
           </Button>
@@ -214,6 +224,8 @@ export function ApiAccessPage() {
           </Button>
         </div>
       </header>
+
+      <GatewayStatusBar upstream={selectedUpstream} />
 
       <div className="flex gap-4">
         <UpstreamColumn

@@ -36,12 +36,8 @@ pub enum KeyPenalty {
 fn indicates_quota_exhaustion(body: &str) -> bool {
     let lowered = body.to_ascii_lowercase();
     [
-        "quota exhausted",
-        "quota exceeded",
         "insufficient_quota",
         "insufficient quota",
-        "resource exhausted",
-        "resource_exhausted",
         "billing_hard_limit_reached",
         "credit balance is too low",
         "exceeded your current quota",
@@ -65,13 +61,19 @@ fn indicates_ban(body: &str) -> bool {
     .any(|needle| lowered.contains(needle))
 }
 
-/// 解析 `retry-after`。支持秒数格式；HTTP-date 格式不解析，交由兜底值处理。
+/// Retry-After can be a non-negative delay or an HTTP-date.
 fn parse_retry_after(retry_after: Option<&str>) -> Option<i64> {
-    retry_after?
-        .trim()
-        .parse::<i64>()
+    let value = retry_after?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.min(MAX_COOLDOWN_SECS as u64) as i64);
+    }
+    chrono::DateTime::parse_from_rfc2822(value)
         .ok()
-        .filter(|secs| *secs > 0)
+        .map(|date| {
+            date.signed_duration_since(chrono::Utc::now())
+                .num_seconds()
+                .max(0)
+        })
 }
 
 fn clamp_cooldown(secs: i64) -> i64 {
@@ -182,14 +184,14 @@ mod tests {
             classify_upstream_status(429, None, None),
             KeyPenalty::Cooldown(DEFAULT_RATE_LIMIT_COOLDOWN_SECS)
         );
-        // HTTP-date 不解析，走兜底
+        // Malformed values use the fallback.
         assert_eq!(
-            classify_upstream_status(429, None, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            classify_upstream_status(429, None, Some("invalid")),
             KeyPenalty::Cooldown(DEFAULT_RATE_LIMIT_COOLDOWN_SECS)
         );
-        // 非正数视为无效
+        // Negative delays are invalid; zero is a valid immediate retry hint.
         assert_eq!(
-            classify_upstream_status(429, None, Some("0")),
+            classify_upstream_status(429, None, Some("-1")),
             KeyPenalty::Cooldown(DEFAULT_RATE_LIMIT_COOLDOWN_SECS)
         );
     }
@@ -210,7 +212,34 @@ mod tests {
         );
         assert_eq!(
             classify_upstream_status(429, Some("RESOURCE_EXHAUSTED: quota exceeded"), None),
-            KeyPenalty::Hard(HardState::QuotaExhausted)
+            KeyPenalty::Cooldown(DEFAULT_RATE_LIMIT_COOLDOWN_SECS)
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_http_dates_and_zero_delay() {
+        let date = (chrono::Utc::now() + chrono::Duration::seconds(45)).to_rfc2822();
+        assert!(matches!(
+            classify_upstream_status(503, None, Some(&date)),
+            KeyPenalty::Cooldown(43..=45)
+        ));
+        assert_eq!(
+            classify_upstream_status(429, None, Some("0")),
+            KeyPenalty::Cooldown(1)
+        );
+    }
+
+    #[test]
+    fn gemini_per_minute_quota_does_not_permanently_disable_a_key() {
+        assert_eq!(
+            classify_upstream_status(
+                429,
+                Some(
+                    r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded for requests per minute"}}"#
+                ),
+                Some("12")
+            ),
+            KeyPenalty::Cooldown(12)
         );
     }
 

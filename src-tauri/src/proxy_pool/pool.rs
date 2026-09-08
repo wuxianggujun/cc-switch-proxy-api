@@ -71,15 +71,22 @@ impl NodePool {
     ///
     /// 保留已有节点的健康状态（跨订阅去重 + 重启恢复都靠这个），
     /// 并解除本订阅对已消失节点的引用。返回被彻底移除的节点 hash。
-    pub fn sync_subscription(&mut self, subscription_id: &str, nodes: Vec<ProxyNode>) -> Vec<String> {
+    pub fn sync_subscription(
+        &mut self,
+        subscription_id: &str,
+        nodes: Vec<ProxyNode>,
+    ) -> Vec<String> {
         let incoming: HashSet<String> = nodes.iter().map(|n| n.hash.clone()).collect();
 
         for node in nodes {
-            let entry = self.entries.entry(node.hash.clone()).or_insert_with(|| PoolEntry {
-                node: node.clone(),
-                health: NodeHealth::default(),
-                subscription_ids: HashSet::new(),
-            });
+            let entry = self
+                .entries
+                .entry(node.hash.clone())
+                .or_insert_with(|| PoolEntry {
+                    node: node.clone(),
+                    health: NodeHealth::default(),
+                    subscription_ids: HashSet::new(),
+                });
             // 已存在则只更新可变元数据（tag 可能改名），健康状态不动
             entry.node.tag = node.tag;
             entry.subscription_ids.insert(subscription_id.to_string());
@@ -301,7 +308,10 @@ impl NodePool {
             .filter(|e| now.saturating_sub(e.health.last_probe_at_ms) >= interval_ms)
             .collect();
         due.sort_by_key(|e| e.health.last_probe_at_ms);
-        due.into_iter().take(limit).map(|e| e.node.clone()).collect()
+        due.into_iter()
+            .take(limit)
+            .map(|e| e.node.clone())
+            .collect()
     }
 
     pub fn all_nodes(&self) -> Vec<ProxyNode> {
@@ -325,6 +335,14 @@ impl NodePool {
 
     pub fn health_of(&self, node_hash: &str) -> Option<NodeHealth> {
         self.entries.get(node_hash).map(|e| e.health.clone())
+    }
+
+    /// 按 hash 取节点的代理 URL。
+    ///
+    /// 节点被撤下前需要拿到 URL 去清 http_client 的连接缓存，而移除操作只
+    /// 返回 hash，所以要在移除之前查一次。
+    pub fn proxy_url_of(&self, node_hash: &str) -> Option<String> {
+        self.entries.get(node_hash).map(|e| e.node.to_proxy_url())
     }
 
     pub fn leases(&self) -> Vec<Lease> {
@@ -496,10 +514,7 @@ mod tests {
             let same_ip_hash = nodes
                 .iter()
                 .find(|n| {
-                    pool.health_of(&n.hash)
-                        .and_then(|h| h.egress_ip)
-                        .as_deref()
-                        == Some(target_ip)
+                    pool.health_of(&n.hash).and_then(|h| h.egress_ip).as_deref() == Some(target_ip)
                 })
                 .expect("has same-ip node")
                 .hash
@@ -550,8 +565,18 @@ mod tests {
     fn p2c_prefers_lower_latency() {
         let mut pool = pool_with(vec![node("fast", 1), node("slow", 2)]);
         let nodes = pool.all_nodes();
-        let fast = nodes.iter().find(|n| n.tag == "fast").expect("fast").hash.clone();
-        let slow = nodes.iter().find(|n| n.tag == "slow").expect("slow").hash.clone();
+        let fast = nodes
+            .iter()
+            .find(|n| n.tag == "fast")
+            .expect("fast")
+            .hash
+            .clone();
+        let slow = nodes
+            .iter()
+            .find(|n| n.tag == "slow")
+            .expect("slow")
+            .hash
+            .clone();
         pool.record_result(&fast, true, Some(10.0));
         pool.record_result(&slow, true, Some(900.0));
 

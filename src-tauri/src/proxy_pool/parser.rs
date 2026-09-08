@@ -83,8 +83,7 @@ fn try_decode_base64(content: &str) -> Option<String> {
 }
 
 fn parse_json(content: &str) -> Result<ParseOutcome, String> {
-    let value: Value =
-        serde_json::from_str(content).map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let value: Value = serde_json::from_str(content).map_err(|e| format!("JSON 解析失败: {e}"))?;
 
     let mut outcome = ParseOutcome::default();
 
@@ -304,7 +303,12 @@ fn extract_port(value: Option<&Value>) -> Option<u16> {
     if let Some(n) = value.as_u64() {
         return u16::try_from(n).ok().filter(|p| *p > 0);
     }
-    value.as_str()?.trim().parse::<u16>().ok().filter(|p| *p > 0)
+    value
+        .as_str()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p > 0)
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -447,7 +451,7 @@ proxies:
         assert_eq!(node.username.as_deref(), Some("u@corp"));
         assert_eq!(node.password.as_deref(), Some("p:s"));
         // 往返：重新编码后仍是合法 URL
-        assert_eq!(node.to_proxy_url(), "socks5://u%40corp:p%3As@1.2.3.4:1080");
+        assert_eq!(node.to_proxy_url(), "socks5h://u%40corp:p%3As@1.2.3.4:1080");
     }
 
     #[test]

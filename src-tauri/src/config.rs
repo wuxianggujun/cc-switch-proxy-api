@@ -201,6 +201,14 @@ pub fn get_claude_settings_path() -> PathBuf {
 
 /// 获取应用配置目录路径 (~/.cc-switch)
 pub fn get_app_config_dir() -> PathBuf {
+    // An explicit test home is an isolation boundary, not a fallback preference.
+    // In-memory DB tests do not create cc-switch.db under the test home; without
+    // this early return the Windows HOME compatibility branch uses live data.
+    if let Ok(home) = std::env::var("CC_SWITCH_TEST_HOME") {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home.trim()).join(".cc-switch");
+        }
+    }
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
     }
@@ -501,6 +509,33 @@ fn atomic_write_with_unix_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_test_home_never_uses_a_legacy_home_database() {
+        struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _home = RestoreEnv("HOME", std::env::var_os("HOME"));
+        let _test_home = RestoreEnv(
+            "CC_SWITCH_TEST_HOME",
+            std::env::var_os("CC_SWITCH_TEST_HOME"),
+        );
+        let legacy = tempfile::tempdir().unwrap();
+        let isolated = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(legacy.path().join(".cc-switch")).unwrap();
+        std::fs::write(legacy.path().join(".cc-switch/cc-switch.db"), b"fixture").unwrap();
+        std::env::set_var("HOME", legacy.path());
+        std::env::set_var("CC_SWITCH_TEST_HOME", isolated.path());
+        assert_eq!(get_app_config_dir(), isolated.path().join(".cc-switch"));
+        assert!(!get_app_config_dir().join("cc-switch.db").exists());
+    }
 
     fn assert_atomic_write_replaces_existing_file(dir: &Path) {
         let path = dir.join("atomic-write-contract.json");

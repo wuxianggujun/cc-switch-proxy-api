@@ -2069,10 +2069,26 @@ pub async fn handle_gemini(
             .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?
     };
 
-    // Gemini 的模型名称在 URI 中
-    let mut ctx = RequestContext::new(&state, &body, &headers, AppType::Gemini, "Gemini", "gemini")
-        .await?
-        .with_model_from_uri(&uri);
+    // Resolve the URI model BEFORE gateway selection. Adding it afterwards let
+    // requests use keys from endpoints restricted to an entirely different model.
+    let mut route_body = body.as_object().cloned().unwrap_or_default();
+    route_body.insert(
+        "model".into(),
+        Value::String(
+            super::handler_context::extract_gemini_model_from_path(uri.path())
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+    );
+    let route_body = Value::Object(route_body);
+    let mut ctx = RequestContext::new(
+        &state,
+        &route_body,
+        &headers,
+        AppType::Gemini,
+        "Gemini",
+        "gemini",
+    )
+    .await?;
 
     // 提取完整的路径和查询参数
     let endpoint = uri

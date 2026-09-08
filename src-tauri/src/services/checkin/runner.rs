@@ -8,7 +8,9 @@ use super::{
     CheckinAuthKind, CheckinBodyKind, CheckinLogin, CheckinRequest, CheckinResult, CheckinSite,
     CheckinStatus,
 };
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, COOKIE, SET_COOKIE};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, COOKIE, SET_COOKIE, USER_AGENT,
+};
 use reqwest::{Client, Method, Response};
 use std::time::Duration;
 
@@ -16,6 +18,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// 响应体只留前 2KB：签到接口的有效信息都在开头，
 /// 失败时整页 HTML 存进数据库没有意义。
 const MAX_BODY: usize = 2048;
+const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -29,6 +32,9 @@ fn now() -> i64 {
 fn build_client(user_agent: &str) -> Result<Client, String> {
     Client::builder()
         .timeout(TIMEOUT)
+        // Keep login Set-Cookie headers on 302/303 responses; following a redirect
+        // without a cookie jar loses the authenticated session.
+        .redirect(reqwest::redirect::Policy::none())
         // 站点常按 UA 拦非浏览器请求。
         .user_agent(user_agent)
         .build()
@@ -92,9 +98,15 @@ async fn execute(
         ),
     };
 
-    let response = send_checkin(&client, &site.request, session_cookie.as_deref()).await?;
+    let response = send_checkin(
+        &client,
+        &site.request,
+        session_cookie.as_deref(),
+        clearance.as_ref().map(|clearance| clearance.user_agent),
+    )
+    .await?;
     let http_status = response.status().as_u16();
-    let body = read_body(response).await;
+    let body = read_body(response).await?;
 
     // 先判是否被 CF 挡下：此时 body 是挑战页而非站点响应，按判定串比对
     // 只会得到「签到失败」，掩盖真实原因，也不会触发重新过闸。
@@ -167,9 +179,12 @@ async fn login_for_cookie(client: &Client, login: &CheckinLogin) -> Result<Strin
     let response = request
         .send()
         .await
-        .map_err(|e| format!("登录请求失败: {e}"))?;
+        .map_err(|e| format!("登录请求失败: {}", e.without_url()))?;
 
     let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        return Err(format!("登录失败（HTTP {}）", status.as_u16()));
+    }
     let cookie = collect_cookies(response.headers());
 
     if cookie.is_empty() {
@@ -199,11 +214,14 @@ async fn send_checkin(
     client: &Client,
     request: &CheckinRequest,
     session_cookie: Option<&str>,
+    enforced_user_agent: Option<&str>,
 ) -> Result<Response, String> {
     let method = Method::from_bytes(request.method.trim().to_uppercase().as_bytes())
         .map_err(|_| format!("不支持的请求方法: {}", request.method))?;
 
     let mut builder = client.request(method, request.url.trim());
+    let mut headers = HeaderMap::new();
+    let mut cookies = indexmap::IndexMap::new();
 
     for header in &request.headers {
         let name = header.name.trim();
@@ -214,14 +232,35 @@ async fn send_checkin(
             HeaderName::from_bytes(name.as_bytes()).map_err(|_| format!("非法请求头名: {name}"))?;
         let header_value = HeaderValue::from_str(header.value.trim())
             .map_err(|_| format!("请求头 {name} 的值含非法字符"))?;
-        builder = builder.header(header_name, header_value);
+        if header_name == COOKIE {
+            merge_cookies(&mut cookies, header.value.trim());
+        } else {
+            headers.insert(header_name, header_value);
+        }
     }
 
     if let Some(cookie) = session_cookie {
-        let value = HeaderValue::from_str(cookie)
-            .map_err(|_| "登录返回的 Cookie 含非法字符".to_string())?;
-        builder = builder.header(COOKIE, value);
+        merge_cookies(&mut cookies, cookie);
     }
+    if !cookies.is_empty() {
+        let cookie = cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&cookie).map_err(|_| "Cookie 含非法字符".to_string())?,
+        );
+    }
+    if let Some(user_agent) = enforced_user_agent {
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(user_agent)
+                .map_err(|_| "浏览器 User-Agent 含非法字符".to_string())?,
+        );
+    }
+    builder = builder.headers(headers);
 
     builder = match request.body_kind {
         CheckinBodyKind::None => builder,
@@ -236,32 +275,52 @@ async fn send_checkin(
     builder
         .send()
         .await
-        .map_err(|e| format!("签到请求失败: {e}"))
+        .map_err(|e| format!("签到请求失败: {}", e.without_url()))
 }
 
-async fn read_body(response: Response) -> String {
-    let text = response.text().await.unwrap_or_default();
-    if text.len() <= MAX_BODY {
-        return text;
+fn merge_cookies(cookies: &mut indexmap::IndexMap<String, String>, header: &str) {
+    for pair in header.split(';') {
+        if let Some((name, value)) = pair.trim().split_once('=') {
+            if !name.is_empty() {
+                cookies.insert(name.to_string(), value.to_string());
+            }
+        }
     }
-    // 按字符边界截断，避免把多字节 UTF-8 切坏。
-    let end = text
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|i| *i <= MAX_BODY)
-        .last()
-        .unwrap_or(0);
-    text[..end].to_string()
+}
+
+async fn read_body(mut response: Response) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("读取签到响应失败: {}", error.without_url()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
+            return Err("签到响应超过 256 KiB 限制".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| "签到响应不是有效的 UTF-8 文本".into())
 }
 
 /// 成功判定。配了判定串就以它为准（多数站点签到失败也返回 200），
 /// 没配则退回看 HTTP 状态码。
 fn judge(success_contains: &str, http_status: u16, body: &str) -> bool {
+    if !(200..300).contains(&http_status) {
+        return false;
+    }
+    if serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("success").and_then(|success| success.as_bool()))
+        == Some(false)
+    {
+        return false;
+    }
     let needle = success_contains.trim();
     if !needle.is_empty() {
         return body.contains(needle);
     }
-    (200..300).contains(&http_status)
+    true
 }
 
 /// 优先取站点返回的 message 字段，取不到就用截断后的原文。
@@ -270,7 +329,7 @@ fn extract_message(body: &str) -> String {
         for key in ["message", "msg", "error", "data"] {
             if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
                 if !text.trim().is_empty() {
-                    return text.trim().to_string();
+                    return truncate_message(text.trim());
                 }
             }
         }
@@ -278,9 +337,61 @@ fn extract_message(body: &str) -> String {
     body.trim().chars().take(200).collect()
 }
 
+fn truncate_message(text: &str) -> String {
+    let mut end = text.len().min(MAX_BODY);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_http_error_cannot_match_success_keyword() {
+        assert!(!judge("success", 500, r#"{"success":false}"#));
+        assert!(!judge("", 200, r#"{"success":false}"#));
+        assert!(!judge("success", 200, r#"{"success":false}"#));
+    }
+
+    #[test]
+    fn browser_cookies_merge_with_manual_login_cookie_without_duplicates() {
+        let mut cookies = indexmap::IndexMap::new();
+        merge_cookies(&mut cookies, "session=old; token=keep");
+        merge_cookies(&mut cookies, "session=fresh; cf_clearance=passed");
+        assert_eq!(cookies.len(), 3);
+        assert_eq!(cookies["session"], "fresh");
+        assert_eq!(cookies["token"], "keep");
+        assert_eq!(cookies["cf_clearance"], "passed");
+    }
+
+    #[tokio::test]
+    async fn readiness_truncated_body_is_not_a_successful_checkin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .await
+                .unwrap();
+        });
+        let site: CheckinSite = serde_json::from_value(serde_json::json!({
+            "id": "test", "name": "test", "authKind": "header",
+            "request": {"url": format!("http://{address}/"), "method": "GET"}
+        }))
+        .unwrap();
+        let result = run_checkin_with(&site, None).await;
+        server.await.unwrap();
+        assert_eq!(result.status, CheckinStatus::Error);
+    }
 
     #[test]
     fn judge_prefers_success_needle_over_status() {

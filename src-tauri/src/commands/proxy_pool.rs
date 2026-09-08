@@ -3,14 +3,16 @@
 //! 前端不直连节点凭据 —— ProxyNode 的 password 字段标了 skip_serializing，
 //! 节点列表只下发地址与健康状态。
 
+use crate::proxy_pool::service::RefreshOutcome;
 use crate::proxy_pool::types::{
     Lease, NodeView, PoolConfig, PoolStats, Subscription, SubscriptionSource,
 };
-use crate::proxy_pool::service::RefreshOutcome;
 use crate::store::AppState;
 
 #[tauri::command]
-pub fn pp_list_subscriptions(state: tauri::State<'_, AppState>) -> Result<Vec<Subscription>, String> {
+pub fn pp_list_subscriptions(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Subscription>, String> {
     state
         .proxy_pool
         .list_subscriptions()

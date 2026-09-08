@@ -1202,29 +1202,28 @@ pub fn run() {
                 }
             }
 
-            // 代理池：恢复节点与租约，按配置决定是否启动探测循环。
-            // 必须在全局代理客户端初始化之后 —— 拉取订阅会复用该客户端。
-            {
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<AppState>();
-                    if let Err(e) = state.proxy_pool.load_from_db().await {
-                        log::error!("[ProxyPool] 恢复代理池失败: {e}");
-                        return;
-                    }
-                    // 注册全局实例，forwarder 在请求路径上通过它选路。
-                    // 必须在 load_from_db 之后 —— 否则首批请求会看到空池。
-                    crate::proxy_pool::init_global(state.proxy_pool.clone());
-                    if state.proxy_pool.get_config().await.enabled {
-                        state.proxy_pool.start_probe_loop().await;
-                    }
-                });
-            }
-
             // 异常退出恢复 + 代理状态自动恢复
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
+
+                state.checkin_runtime.start(app_handle.clone(), state.inner().clone()).await;
+
+                // Restore exits BEFORE listening/restoring takeover, so the first
+                // requests cannot silently bypass an enabled persisted pool.
+                let pool_ready = match state.proxy_pool.load_from_db().await {
+                    Ok(()) => {
+                        crate::proxy_pool::init_global(state.proxy_pool.clone());
+                        if state.proxy_pool.get_config().await.enabled {
+                            state.proxy_pool.start_probe_loop().await;
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        log::error!("[ProxyPool] 恢复代理池失败，未自动恢复代理服务: {error}");
+                        false
+                    }
+                };
 
                 // 检查是否有 Live 备份（表示上次异常退出时可能处于接管状态）
                 let has_backups = match state.db.has_any_live_backup().await {
@@ -1260,7 +1259,9 @@ pub fn run() {
                 initialize_common_config_snippets(&state);
 
                 // 检查 settings 表中的代理状态，自动恢复代理服务
-                restore_proxy_state_on_startup(&state).await;
+                if pool_ready {
+                    restore_proxy_state_on_startup(&state).await;
+                }
 
                 // Periodic backup check (on startup)
                 if let Err(e) = state.db.periodic_backup_if_needed() {
@@ -1936,6 +1937,7 @@ pub fn run() {
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
+        state.checkin_runtime.shutdown().await;
         // 停探测循环并落盘租约，避免下次启动丢失粘性绑定
         state.proxy_pool.shutdown().await;
 

@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+mod api_gateway;
 mod auth;
 mod balance;
 mod checkin;
@@ -9,7 +10,6 @@ mod config;
 mod copilot;
 mod deeplink;
 mod env;
-mod api_gateway;
 mod failover;
 mod global_proxy;
 mod hermes;
@@ -40,6 +40,7 @@ mod usage;
 mod webdav_sync;
 mod workspace;
 
+pub use api_gateway::*;
 pub use auth::*;
 pub use balance::*;
 pub use checkin::*;
@@ -49,7 +50,6 @@ pub use config::*;
 pub use copilot::*;
 pub use deeplink::*;
 pub use env::*;
-pub use api_gateway::*;
 pub use failover::*;
 pub use global_proxy::*;
 pub use hermes::*;

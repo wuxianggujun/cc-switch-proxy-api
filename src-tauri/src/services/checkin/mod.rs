@@ -16,7 +16,9 @@
 //! S3 secret_access_key 一致）。前端面板必须显式告知用户这一点。
 
 pub mod browser;
+pub mod executor;
 pub mod runner;
+pub mod scheduler;
 
 use crate::error::AppError;
 use crate::store::AppState;
@@ -223,7 +225,7 @@ impl CheckinSite {
 }
 
 /// 全局签到配置（含站点列表与调度设置）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckinConfig {
     #[serde(default)]
@@ -241,6 +243,17 @@ pub struct CheckinConfig {
 
 fn default_schedule_hour() -> u8 {
     9
+}
+
+impl Default for CheckinConfig {
+    fn default() -> Self {
+        Self {
+            sites: Vec::new(),
+            schedule_enabled: false,
+            schedule_hour: default_schedule_hour(),
+            last_run_date: None,
+        }
+    }
 }
 
 /// settings 表里的存储键。复用键值表而非新建表，避免占用 SCHEMA_VERSION。
@@ -268,7 +281,7 @@ impl CheckinService {
     /// 避免前端提交表单时把历史结果清掉。
     pub fn upsert_site(state: &AppState, mut site: CheckinSite) -> Result<CheckinSite, AppError> {
         Self::validate(&site)?;
-
+        let _guard = lock_config(state)?;
         let mut config = Self::load(state)?;
 
         if site.id.trim().is_empty() {
@@ -307,6 +320,7 @@ impl CheckinService {
     }
 
     pub fn delete_site(state: &AppState, id: &str) -> Result<bool, AppError> {
+        let _guard = lock_config(state)?;
         let mut config = Self::load(state)?;
         let before = config.sites.len();
         config.sites.retain(|s| s.id != id);
@@ -327,6 +341,7 @@ impl CheckinService {
                 "签到时间必须在 0-23 之间，收到 {schedule_hour}"
             )));
         }
+        let _guard = lock_config(state)?;
         let mut config = Self::load(state)?;
         config.schedule_enabled = schedule_enabled;
         config.schedule_hour = schedule_hour;
@@ -340,6 +355,7 @@ impl CheckinService {
         id: &str,
         clearance: CheckinClearance,
     ) -> Result<(), AppError> {
+        let _guard = lock_config(state)?;
         let mut config = Self::load(state)?;
         if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
             site.browser
@@ -355,6 +371,7 @@ impl CheckinService {
 
     /// 丢弃过闸凭证。签到被判定为遭 CF 拦截时调用，下次强制重新过闸。
     pub fn clear_clearance(state: &AppState, id: &str) -> Result<(), AppError> {
+        let _guard = lock_config(state)?;
         let mut config = Self::load(state)?;
         if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
             if let Some(browser) = site.browser.as_mut() {
@@ -373,12 +390,20 @@ impl CheckinService {
         id: &str,
         result: CheckinResult,
     ) -> Result<(), AppError> {
+        let _guard = lock_config(state)?;
         let mut config = Self::load(state)?;
         if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
             site.last_result = Some(result);
             Self::save(state, &config)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn complete_scheduled_run(state: &AppState, date: String) -> Result<(), AppError> {
+        let _guard = lock_config(state)?;
+        let mut config = Self::load(state)?;
+        config.last_run_date = Some(date);
+        Self::save(state, &config)
     }
 
     fn validate(site: &CheckinSite) -> Result<(), AppError> {
@@ -426,8 +451,20 @@ impl CheckinService {
 }
 
 fn is_http_url(url: &str) -> bool {
-    let trimmed = url.trim();
-    trimmed.starts_with("http://") || trimmed.starts_with("https://")
+    url::Url::parse(url.trim()).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+fn lock_config(state: &AppState) -> Result<std::sync::MutexGuard<'_, ()>, AppError> {
+    state
+        .checkin_runtime
+        .config_write
+        .lock()
+        .map_err(|_| AppError::Config("签到配置写入锁不可用".into()))
 }
 
 #[cfg(test)]
@@ -435,6 +472,17 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use std::sync::Arc;
+
+    #[test]
+    fn readiness_default_schedule_hour_is_nine() {
+        assert_eq!(CheckinConfig::default().schedule_hour, 9);
+        assert_eq!(
+            serde_json::from_str::<CheckinConfig>("{}")
+                .unwrap()
+                .schedule_hour,
+            9
+        );
+    }
 
     fn browser_site(challenge_url: &str, site_url: &str, request_url: &str) -> CheckinSite {
         CheckinSite {

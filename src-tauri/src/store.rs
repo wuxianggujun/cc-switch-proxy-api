@@ -14,6 +14,7 @@ pub struct AppState {
     // `&self`，无需外层 RwLock；避免持有粗粒度锁跨网络刷新导致的连锁阻塞。
     pub codex_oauth_manager: Arc<CodexOAuthManager>,
     pub proxy_pool: ProxyPoolService,
+    pub checkin_runtime: Arc<crate::services::checkin::scheduler::CheckinRuntime>,
 }
 
 impl AppState {
@@ -31,6 +32,9 @@ impl AppState {
             usage_cache: Arc::new(UsageCache::new()),
             codex_oauth_manager,
             proxy_pool,
+            checkin_runtime: Arc::new(
+                crate::services::checkin::scheduler::CheckinRuntime::default(),
+            ),
         }
     }
 }

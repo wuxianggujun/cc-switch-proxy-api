@@ -116,16 +116,34 @@ impl ProxyNode {
         };
         format!(
             "{}://{}{}:{}",
-            self.protocol.as_str(),
+            // Resolve upstream names at the SOCKS exit, not local DNS.
+            if self.protocol == NodeProtocol::Socks5 {
+                "socks5h"
+            } else {
+                self.protocol.as_str()
+            },
             auth,
-            self.host,
+            self.url_host(),
             self.port
         )
     }
 
     /// 日志/UI 用的地址，不含凭据
     pub fn endpoint(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format!("{}:{}", self.url_host(), self.port)
+    }
+
+    fn url_host(&self) -> String {
+        let host = self
+            .host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        }
     }
 }
 
@@ -174,7 +192,9 @@ impl NodeHealth {
 
     pub fn record_failure(&mut self, max_failures: u32, now_ms: i64) {
         self.failure_count = self.failure_count.saturating_add(1);
-        if self.failure_count >= max_failures && self.circuit_open_since_ms == 0 {
+        if self.failure_count >= max_failures {
+            // A failed half-open attempt starts a new cooldown instead of leaving
+            // an already-expired circuit permanently eligible for every request.
             self.circuit_open_since_ms = now_ms;
         }
     }
@@ -201,7 +221,7 @@ pub enum SubscriptionSource {
     Inline,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Subscription {
     pub id: String,
@@ -243,7 +263,7 @@ pub struct Lease {
 
 /// 池的调度参数
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct PoolConfig {
     pub enabled: bool,
     /// 连续失败多少次触发熔断
@@ -277,6 +297,48 @@ impl Default for PoolConfig {
             egress_probe_url: "https://api.ipify.org".to_string(),
             latency_probe_url: "https://www.gstatic.com/generate_204".to_string(),
         }
+    }
+}
+
+impl PoolConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        const MAX_INTERVAL_SECS: u64 = 365 * 24 * 60 * 60;
+        if !(1..=100).contains(&self.max_consecutive_failures) {
+            return Err("连续失败阈值必须在 1-100 之间".into());
+        }
+        if !(1..=128).contains(&self.probe_concurrency) {
+            return Err("探测并发数必须在 1-128 之间".into());
+        }
+        if !(1..=300).contains(&self.probe_timeout_secs) {
+            return Err("探测超时必须在 1-300 秒之间".into());
+        }
+        if [
+            self.circuit_cooldown_secs,
+            self.lease_ttl_secs,
+            self.probe_interval_secs,
+        ]
+        .iter()
+        .any(|interval| *interval > MAX_INTERVAL_SECS)
+        {
+            return Err("代理池时间间隔不能超过一年".into());
+        }
+        for (label, raw) in [
+            ("出口 IP", &self.egress_probe_url),
+            ("延迟", &self.latency_probe_url),
+        ] {
+            if label == "延迟" && raw.trim().is_empty() {
+                continue;
+            }
+            let url = url::Url::parse(raw.trim()).map_err(|_| format!("{label}探测地址无效"))?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err(format!("{label}探测地址必须是无内嵌凭据的 HTTP(S) URL"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -327,6 +389,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn readiness_ipv6_proxy_urls_are_valid() {
+        let node = ProxyNode::new(
+            NodeProtocol::Http,
+            "2001:db8::1".into(),
+            8080,
+            None,
+            None,
+            "ipv6".into(),
+        );
+        assert_eq!(node.to_proxy_url(), "http://[2001:db8::1]:8080");
+        assert!(url::Url::parse(&node.to_proxy_url()).is_ok());
+    }
+
+    #[test]
+    fn readiness_failed_half_open_probe_restarts_cooldown() {
+        let mut health = NodeHealth::default();
+        health.record_failure(1, 1000);
+        health.record_failure(1, 2000);
+        assert!(!health.is_cooled_down(1000, 2500));
+    }
+
+    #[test]
     fn hash_is_stable_and_host_case_insensitive() {
         let a = ProxyNode::compute_hash(NodeProtocol::Http, "Example.COM", 8080, None, None);
         let b = ProxyNode::compute_hash(NodeProtocol::Http, "example.com", 8080, None, None);
@@ -352,7 +436,7 @@ mod tests {
             "t".into(),
         );
         let url = node.to_proxy_url();
-        assert_eq!(url, "socks5://user%40corp:p%3Aa%2Fs%40s@1.2.3.4:1080");
+        assert_eq!(url, "socks5h://user%40corp:p%3Aa%2Fs%40s@1.2.3.4:1080");
         // 转义后必须仍能被 url crate 正确解析回原值
         let parsed = url::Url::parse(&url).expect("must parse");
         assert_eq!(parsed.username(), "user%40corp");

@@ -1,7 +1,13 @@
 import { useTranslation } from "react-i18next";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { GripVertical, Pencil, Trash2, KeyRound, RotateCcw } from "lucide-react";
+import {
+  GripVertical,
+  Pencil,
+  Trash2,
+  KeyRound,
+  RotateCcw,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
@@ -42,8 +48,14 @@ export function EndpointRow({
   onClearKeyPenalty,
 }: EndpointRowProps) {
   const { t } = useTranslation();
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id: endpoint.id });
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: endpoint.id });
   const nowSecs = Math.floor(Date.now() / 1000);
 
   return (
@@ -158,7 +170,9 @@ export function EndpointRow({
                     </span>
                     {penalty && (
                       <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-destructive">
-                        {t(`apiAccess.${penalty === "cooldown" ? "cooldown" : penalty === "quota_exhausted" ? "quotaExhausted" : penalty === "auth_invalid" ? "authInvalid" : "banned"}`)}
+                        {t(
+                          `apiAccess.${penalty === "cooldown" ? "cooldown" : penalty === "quota_exhausted" ? "quotaExhausted" : penalty === "auth_invalid" ? "authInvalid" : "banned"}`,
+                        )}
                       </span>
                     )}
                     <div className="ml-auto flex items-center gap-1.5">
@@ -177,7 +191,9 @@ export function EndpointRow({
                       )}
                       <Switch
                         checked={key.enabled}
-                        onCheckedChange={(next) => onToggleKeyEnabled(key, next)}
+                        onCheckedChange={(next) =>
+                          onToggleKeyEnabled(key, next)
+                        }
                         aria-label={key.keyLast4}
                       />
                       <Button

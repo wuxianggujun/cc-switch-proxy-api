@@ -3288,6 +3288,8 @@
     "runAll": "すべてチェックイン ({{count}})",
     "runningAll": "チェックイン中...",
     "scheduleLabel": "毎日自動チェックイン",
+    "scheduleHint": "ローカル時刻で実行し、起動・復帰後は当日分を補完します。アプリを起動したままにし、必要に応じて設定で自動起動とトレイへの格納を有効にしてください。",
+    "lastScheduledRun": "前回の自動実行日",
     "plaintextNotice": "サイトの認証情報はローカルデータベースに平文で保存されます。共有パソコンでは使用しないでください。",
     "empty": "サイトがまだありません。「サイトを追加」から始めてください。",
     "saveSuccess": "保存しました",
@@ -3481,6 +3483,13 @@
     }
   },
   "apiAccess": {
+    "gateway": {
+      "title": "ローカル API ゲートウェイ",
+      "baseUrl": "クライアントのベース URL",
+      "start": "ゲートウェイを起動",
+      "running": "ゲートウェイ稼働中",
+      "hint": "接続先の追加だけでは CLI 設定は変更されません。起動後、このアドレスをクライアントのベース URL に設定してください。OpenAI / DeepSeek は Chat Completions と Codex Responses に対応します。"
+    },
     "title": "API 接続",
     "subtitle": "PROVIDERS",
     "count": "接続 {{count}} 件",

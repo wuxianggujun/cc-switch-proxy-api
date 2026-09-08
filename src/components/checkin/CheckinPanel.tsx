@@ -107,8 +107,9 @@ export function CheckinPanel() {
 
         <div className="flex items-center gap-2">
           <Switch
+            aria-label={t("checkin.scheduleLabel")}
             checked={config?.scheduleEnabled ?? false}
-            disabled={setSchedule.isPending}
+            disabled={!config || setSchedule.isPending}
             onCheckedChange={(checked) =>
               setSchedule.mutate({
                 scheduleEnabled: checked,
@@ -120,6 +121,7 @@ export function CheckinPanel() {
             {t("checkin.scheduleLabel")}
           </span>
           <Select
+            disabled={!config || setSchedule.isPending}
             value={String(config?.scheduleHour ?? 9)}
             onValueChange={(value) =>
               setSchedule.mutate({
@@ -142,6 +144,12 @@ export function CheckinPanel() {
         </div>
       </div>
 
+      <p className="pb-2 text-xs text-muted-foreground">
+        {t("checkin.scheduleHint")}
+      </p>
+      <p className="pb-3 text-xs text-muted-foreground">
+        {t("checkin.lastScheduledRun")}: {config?.lastRunDate ?? "—"}
+      </p>
       <p className="pb-3 text-xs text-amber-600 dark:text-amber-400">
         {t("checkin.plaintextNotice")}
       </p>

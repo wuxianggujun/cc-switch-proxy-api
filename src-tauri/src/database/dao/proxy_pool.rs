@@ -480,8 +480,10 @@ mod tests {
         db.pp_upsert_subscription(&sub("s1")).expect("s1");
         db.pp_upsert_subscription(&sub("s2")).expect("s2");
         let n = node(1080);
-        db.pp_sync_subscription_nodes("s1", &[n.clone()]).expect("sync1");
-        db.pp_sync_subscription_nodes("s2", &[n.clone()]).expect("sync2");
+        db.pp_sync_subscription_nodes("s1", &[n.clone()])
+            .expect("sync1");
+        db.pp_sync_subscription_nodes("s2", &[n.clone()])
+            .expect("sync2");
 
         let loaded = db.pp_load_nodes().expect("load");
         assert_eq!(loaded.len(), 1);
@@ -503,7 +505,8 @@ mod tests {
         let db = test_db();
         db.pp_upsert_subscription(&sub("s1")).expect("sub");
         let n = node(1080);
-        db.pp_sync_subscription_nodes("s1", &[n.clone()]).expect("sync");
+        db.pp_sync_subscription_nodes("s1", &[n.clone()])
+            .expect("sync");
 
         let lease = Lease {
             sticky_key: "provider-a".into(),
@@ -529,7 +532,8 @@ mod tests {
         let db = test_db();
         db.pp_upsert_subscription(&sub("s1")).expect("sub");
         let n = node(1080);
-        db.pp_sync_subscription_nodes("s1", &[n.clone()]).expect("sync");
+        db.pp_sync_subscription_nodes("s1", &[n.clone()])
+            .expect("sync");
         db.pp_save_leases(&[Lease {
             sticky_key: "k".into(),
             node_hash: n.hash.clone(),

@@ -3289,6 +3289,8 @@
     "runAll": "全部簽到 ({{count}})",
     "runningAll": "簽到中...",
     "scheduleLabel": "每日自動簽到",
+    "scheduleHint": "依本機時間執行，啟動或喚醒後補執行當日任務；應用程式需保持執行。可在設定中開啟開機自啟及關閉至系統匣。",
+    "lastScheduledRun": "最近自動執行日期",
     "plaintextNotice": "站點憑證以明文儲存在本機資料庫中，請勿在共用電腦上使用。",
     "empty": "尚未新增站點，點擊「新增站點」開始。",
     "saveSuccess": "已儲存",
@@ -3482,6 +3484,13 @@
     }
   },
   "apiAccess": {
+    "gateway": {
+      "title": "本機 API 閘道",
+      "baseUrl": "用戶端基礎位址",
+      "start": "啟動閘道",
+      "running": "閘道執行中",
+      "hint": "新增接入點不會自動改寫 CLI 設定。啟動後，請將用戶端 Base URL 設為此位址；OpenAI / DeepSeek 線路支援 Chat Completions，也可供 Codex Responses 用戶端呼叫。"
+    },
     "title": "API 接入",
     "subtitle": "PROVIDERS",
     "count": "{{count}} 個接入",

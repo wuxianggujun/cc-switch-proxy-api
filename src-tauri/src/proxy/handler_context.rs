@@ -8,7 +8,7 @@ use crate::provider::Provider;
 use crate::proxy::{
     extract_session_id,
     forwarder::RequestForwarder,
-    gateway_route::candidate_to_provider,
+    gateway_route::{candidate_to_provider, is_gateway_provider},
     server::ProxyState,
     types::{AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, RectifierConfig},
     ProxyError,
@@ -18,42 +18,53 @@ use std::time::Instant;
 
 /// app_type → 网关上游类型。
 ///
-/// 只映射协议族确定的几个。`claude-desktop` 与 Claude 同协议但走独立命名空间
-/// 与鉴权，不并入；OAuth/托管账号类（OpenCode、OpenClaw、Hermes、Pi、GrokBuild）
-/// 是账号绑定语义，与 key 轮询天然冲突，一律不参与网关选线。
-fn gateway_upstream_for(app_type: &AppType) -> Option<UpstreamType> {
+/// 本轮覆盖 Claude/Codex/Gemini 入口。其它应用的专有命名空间沿用原有
+/// provider/账号绑定逻辑；它们也可能支持 API Key，但不能据此直接混用
+/// 不同命名空间、鉴权或有状态 OAuth 会话。
+fn gateway_upstreams_for(app_type: &AppType) -> &'static [UpstreamType] {
     match app_type {
-        AppType::Claude => Some(UpstreamType::Claude),
-        AppType::Codex => Some(UpstreamType::Codex),
-        AppType::Gemini => Some(UpstreamType::Gemini),
-        _ => None,
+        AppType::Claude => &[UpstreamType::Claude],
+        AppType::Codex => &[
+            UpstreamType::Codex,
+            UpstreamType::Openai,
+            UpstreamType::Deepseek,
+        ],
+        AppType::Gemini => &[UpstreamType::Gemini],
+        _ => &[],
     }
 }
 
 /// 查网关候选并合成为 Provider 列表。
 ///
-/// 返回空列表表示"网关没配相应线路"，调用方据此回落老链。查询失败也返回空——
-/// 网关是增量能力，它的故障不该让老链一起不可用。
+/// Only an unconfigured/disabled gateway falls back to legacy providers.
+/// An exhausted key set, model mismatch or database error must not silently route
+/// the user's request through a different account or billing configuration.
 fn select_gateway_providers(
     state: &ProxyState,
     app_type: &AppType,
     request_model: &str,
-) -> Vec<Provider> {
-    let Some(upstream) = gateway_upstream_for(app_type) else {
-        return Vec::new();
-    };
-
-    // request_model 在提取失败时是 "unknown"，那不是真实模型名。传 None 让
-    // 限定模型的接入点不参与，只用不限模型的线路兜底。
-    let model = (request_model != "unknown").then_some(request_model);
-
-    match state.db.select_route_candidates(upstream, model) {
-        Ok(candidates) => candidates.iter().map(candidate_to_provider).collect(),
-        Err(e) => {
-            log::warn!("[gateway] 选线查询失败，回落老链: {e}");
-            Vec::new()
-        }
+) -> Result<Option<Vec<Provider>>, ProxyError> {
+    let upstreams = gateway_upstreams_for(app_type);
+    if upstreams.is_empty() {
+        return Ok(None);
     }
+
+    // Catalog/metadata requests have no model to filter. Gemini generation
+    // requests have already resolved their URI model before reaching this point.
+    let model = (request_model != "unknown").then_some(request_model);
+    let candidates = state
+        .db
+        .reserve_route_candidates(upstreams, model)
+        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+    candidates
+        .map(|routes| {
+            if routes.is_empty() {
+                Err(ProxyError::NoAvailableProvider)
+            } else {
+                Ok(routes.iter().map(candidate_to_provider).collect())
+            }
+        })
+        .transpose()
 }
 
 /// 流式超时配置
@@ -176,9 +187,15 @@ impl RequestContext {
         // 网关链配了线路就用它——它自带优先级分层与 LRU 轮询，且候选序列是
         // per-request 构建的，降级不粘滞。没配则回落到老的 providers 表，
         // 保持既有行为不变（用户要求双轨并存）。
-        let gateway_providers = select_gateway_providers(state, &app_type, &request_model);
+        let gateway_providers = select_gateway_providers(state, &app_type, &request_model)?;
 
-        let providers = if gateway_providers.is_empty() {
+        let providers = if let Some(gateway_providers) = gateway_providers {
+            log::debug!(
+                "[{tag}] 网关选线命中 {} 条候选线路",
+                gateway_providers.len()
+            );
+            gateway_providers
+        } else {
             // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
             // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
             state
@@ -194,13 +211,6 @@ impl RequestContext {
                     }
                     _ => ProxyError::DatabaseError(e.to_string()),
                 })?
-        } else {
-            log::debug!(
-                "[{}] 网关选线命中 {} 条候选线路",
-                tag,
-                gateway_providers.len()
-            );
-            gateway_providers
         };
 
         let provider = providers
@@ -236,21 +246,6 @@ impl RequestContext {
         })
     }
 
-    /// 从 URI 提取模型名称（Gemini 专用）
-    ///
-    /// Gemini API 的模型名称在 URI 中，格式如：
-    /// `/v1beta/models/gemini-pro:generateContent`
-    pub fn with_model_from_uri(mut self, uri: &axum::http::Uri) -> Self {
-        // 用 path() 而不是 path_and_query()：模型名必须从路径段中解析，
-        // 否则 GET /v1beta/models/<id>?key=... 会把 query 拼到 request_model 上。
-        let endpoint = uri.path();
-
-        self.request_model =
-            extract_gemini_model_from_path(endpoint).unwrap_or_else(|| "unknown".to_string());
-
-        self
-    }
-
     /// 创建 RequestForwarder
     ///
     /// 使用共享的 ProviderRouter，确保熔断器状态跨请求保持
@@ -260,7 +255,7 @@ impl RequestContext {
     /// - 故障转移关闭：超时配置不生效（全部传入 0）
     pub fn create_forwarder(&self, state: &ProxyState) -> RequestForwarder {
         let (non_streaming_timeout, first_byte_timeout, idle_timeout) =
-            if self.app_config.auto_failover_enabled {
+            if self.routing_retry_enabled() {
                 // 故障转移开启：使用配置的值（0 = 禁用超时）
                 (
                     self.app_config.non_streaming_timeout as u64,
@@ -277,7 +272,7 @@ impl RequestContext {
             };
 
         // 故障转移关闭时强制 max_retries=0（仅尝试 1 个 provider），与「不超时 + 不切换」语义一致。
-        let max_retries = if self.app_config.auto_failover_enabled {
+        let max_retries = if self.routing_retry_enabled() {
             self.app_config.max_retries
         } else {
             0
@@ -324,7 +319,7 @@ impl RequestContext {
     /// - 故障转移关闭：返回 0（禁用超时检查）
     #[inline]
     pub fn streaming_timeout_config(&self) -> StreamingTimeoutConfig {
-        if self.app_config.auto_failover_enabled {
+        if self.routing_retry_enabled() {
             // 故障转移开启：使用配置的值（0 = 禁用超时）
             StreamingTimeoutConfig {
                 first_byte_timeout: self.app_config.streaming_first_byte_timeout as u64,
@@ -337,6 +332,10 @@ impl RequestContext {
                 idle_timeout: 0,
             }
         }
+    }
+
+    fn routing_retry_enabled(&self) -> bool {
+        self.app_config.auto_failover_enabled || is_gateway_provider(&self.provider)
     }
 }
 

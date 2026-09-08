@@ -1,8 +1,8 @@
 //! 节点探测
 //!
-//! 两类探测合成一次网络往返：
+//! 两类探测共享单节点超时预算：
 //! - 出口 IP：请求回显服务，响应体就是出口 IP，粘性路由靠它做同 IP 迁移
-//! - 延迟：测到响应头的耗时，喂给 EWMA
+//! - 延迟：访问配置的延迟目标；留空或与回显地址相同时复用回显耗时
 //!
 //! reqwest 的代理是 client 级配置，所以每个节点都要单独建 client。探测频率低
 //! （默认 10 分钟一轮），这个开销可以接受。
@@ -39,16 +39,21 @@ const MAX_EGRESS_BODY_BYTES: usize = 256;
 
 /// 探测单个节点。
 ///
-/// 只发一个请求：向出口 IP 回显服务发 GET，同时测延迟。分开测两个 URL
-/// 会让探测开销翻倍，而 IP 回显服务的延迟同样能反映节点质量。
-pub async fn probe_node(node: &ProxyNode, egress_url: &str, timeout: Duration) -> ProbeResult {
+/// IP echo and optional latency target share one overall timeout budget.
+/// An empty/equal latency URL reuses the echo request's header latency.
+pub async fn probe_node(
+    node: &ProxyNode,
+    egress_url: &str,
+    latency_url: &str,
+    timeout: Duration,
+) -> ProbeResult {
     let client = match build_probe_client(node, timeout) {
         Ok(client) => client,
         Err(e) => return ProbeResult::failed(node.hash.clone(), e),
     };
 
     let started = Instant::now();
-    let response = match client.get(egress_url).send().await {
+    let mut response = match client.get(egress_url).send().await {
         Ok(resp) => resp,
         Err(e) => {
             return ProbeResult::failed(node.hash.clone(), summarize_reqwest_error(&e));
@@ -69,10 +74,53 @@ pub async fn probe_node(node: &ProxyNode, egress_url: &str, timeout: Duration) -
         };
     }
 
-    let egress_ip = match response.text().await {
-        Ok(body) => parse_egress_ip(&body),
-        // 响应头已到，body 读失败不影响延迟结论
-        Err(_) => None,
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > MAX_EGRESS_BODY_BYTES {
+                    return ProbeResult::failed(node.hash.clone(), "出口探测响应过大".into());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                return ProbeResult::failed(node.hash.clone(), summarize_reqwest_error(&error))
+            }
+        }
+    }
+    let egress_ip = std::str::from_utf8(&body).ok().and_then(parse_egress_ip);
+    if egress_ip.is_none() {
+        return ProbeResult::failed(node.hash.clone(), "出口探测没有返回有效 IP".into());
+    }
+
+    let latency_ms = if latency_url.trim().is_empty() || latency_url.trim() == egress_url.trim() {
+        latency_ms
+    } else {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return ProbeResult::failed(node.hash.clone(), "超时".into());
+        }
+        let latency_started = Instant::now();
+        match client
+            .get(latency_url.trim())
+            .timeout(remaining)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                latency_started.elapsed().as_secs_f64() * 1000.0
+            }
+            Ok(response) => {
+                return ProbeResult::failed(
+                    node.hash.clone(),
+                    format!("延迟探测 HTTP {}", response.status().as_u16()),
+                )
+            }
+            Err(error) => {
+                return ProbeResult::failed(node.hash.clone(), summarize_reqwest_error(&error))
+            }
+        }
     };
 
     ProbeResult {
@@ -88,6 +136,7 @@ pub async fn probe_node(node: &ProxyNode, egress_url: &str, timeout: Duration) -
 pub async fn probe_batch(
     nodes: &[ProxyNode],
     egress_url: &str,
+    latency_url: &str,
     timeout: Duration,
     concurrency: usize,
 ) -> Vec<ProbeResult> {
@@ -97,7 +146,7 @@ pub async fn probe_batch(
     for chunk in nodes.chunks(concurrency) {
         let batch = chunk
             .iter()
-            .map(|node| probe_node(node, egress_url, timeout));
+            .map(|node| probe_node(node, egress_url, latency_url, timeout));
         results.extend(futures::future::join_all(batch).await);
     }
 
@@ -125,7 +174,10 @@ fn parse_egress_ip(body: &str) -> Option<String> {
         return None;
     }
     let trimmed = body.trim();
-    trimmed.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string())
+    trimmed
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
 }
 
 /// 把 reqwest 错误压缩成短原因，避免把完整 URL（可能含凭据）写进 UI
@@ -186,7 +238,13 @@ mod tests {
     #[tokio::test]
     async fn probe_fails_fast_on_dead_port() {
         // 9 端口（discard）通常无监听，用于验证失败路径不 panic 且返回错误
-        let result = probe_node(&node(9), "http://example.invalid", Duration::from_millis(300)).await;
+        let result = probe_node(
+            &node(9),
+            "http://example.invalid",
+            "",
+            Duration::from_millis(300),
+        )
+        .await;
         assert!(!result.success);
         assert!(result.error.is_some());
         assert_eq!(result.egress_ip, None);
@@ -198,6 +256,7 @@ mod tests {
         let results = probe_batch(
             &nodes,
             "http://example.invalid",
+            "",
             Duration::from_millis(200),
             2,
         )
@@ -212,7 +271,8 @@ mod tests {
 
     #[tokio::test]
     async fn probe_batch_handles_empty_input() {
-        let results = probe_batch(&[], "http://example.invalid", Duration::from_secs(1), 4).await;
+        let results =
+            probe_batch(&[], "http://example.invalid", "", Duration::from_secs(1), 4).await;
         assert!(results.is_empty());
     }
 }

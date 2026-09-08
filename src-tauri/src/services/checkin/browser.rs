@@ -47,6 +47,16 @@ pub struct ClearanceOutcome {
     pub needed_interaction: bool,
 }
 
+struct ClearanceWindow(tauri::WebviewWindow);
+
+impl Drop for ClearanceWindow {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.destroy() {
+            log::debug!("[Checkin] 关闭验证窗口: {error}");
+        }
+    }
+}
+
 /// 打开 WebView 过闸并取回 cookie。
 ///
 /// 先隐藏窗口尝试自动过（非交互式挑战）；超时仍未拿到 cookie，则显示窗口
@@ -78,10 +88,9 @@ pub async fn acquire_clearance(app: &AppHandle, url: &str) -> Result<ClearanceOu
         .build()
         .map_err(|e| format!("创建验证窗口失败: {e}"))?;
 
-    // 无论成败都销毁窗口，否则残留不可见窗口会拖住退出流程。
-    let outcome = run_challenge(&window, &parsed).await;
-    let _ = window.destroy();
-    outcome
+    // RAII also destroys a hidden window if shutdown cancels the awaiting task.
+    let window = ClearanceWindow(window);
+    run_challenge(&window.0, &parsed).await
 }
 
 async fn run_challenge(

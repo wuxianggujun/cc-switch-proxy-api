@@ -23,7 +23,10 @@ pub async fn create_api_endpoint(
     state: State<'_, AppState>,
     endpoint: NewApiEndpoint,
 ) -> Result<String, String> {
-    state.db.create_api_endpoint(&endpoint).map_err(|e| e.to_string())
+    state
+        .db
+        .create_api_endpoint(&endpoint)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -31,7 +34,10 @@ pub async fn update_api_endpoint(
     state: State<'_, AppState>,
     endpoint: ApiEndpointRecord,
 ) -> Result<(), String> {
-    state.db.update_api_endpoint(&endpoint).map_err(|e| e.to_string())
+    state
+        .db
+        .update_api_endpoint(&endpoint)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -39,7 +45,9 @@ pub async fn delete_api_endpoint(
     state: State<'_, AppState>,
     endpoint_id: String,
 ) -> Result<(), String> {
-    state.db.delete_api_endpoint(&endpoint_id)
+    state
+        .db
+        .delete_api_endpoint(&endpoint_id)
         .map_err(|e| e.to_string())
 }
 
@@ -49,7 +57,9 @@ pub async fn reorder_api_endpoints(
     state: State<'_, AppState>,
     endpoint_ids: Vec<String>,
 ) -> Result<(), String> {
-    state.db.reorder_api_endpoints(&endpoint_ids)
+    state
+        .db
+        .reorder_api_endpoints(&endpoint_ids)
         .map_err(|e| e.to_string())
 }
 
@@ -59,7 +69,9 @@ pub async fn set_api_endpoint_enabled(
     endpoint_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    state.db.set_api_endpoint_enabled(&endpoint_id, enabled)
+    state
+        .db
+        .set_api_endpoint_enabled(&endpoint_id, enabled)
         .map_err(|e| e.to_string())
 }
 
@@ -70,22 +82,19 @@ pub async fn list_api_keys(
     state: State<'_, AppState>,
     endpoint_id: String,
 ) -> Result<Vec<ApiKeyRecord>, String> {
-    state.db.list_api_keys(&endpoint_id).map_err(|e| e.to_string())
+    state
+        .db
+        .list_api_keys(&endpoint_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn create_api_key(
-    state: State<'_, AppState>,
-    key: NewApiKey,
-) -> Result<String, String> {
+pub async fn create_api_key(state: State<'_, AppState>, key: NewApiKey) -> Result<String, String> {
     state.db.create_api_key(&key).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn delete_api_key(
-    state: State<'_, AppState>,
-    key_id: String,
-) -> Result<(), String> {
+pub async fn delete_api_key(state: State<'_, AppState>, key_id: String) -> Result<(), String> {
     state.db.delete_api_key(&key_id).map_err(|e| e.to_string())
 }
 
@@ -95,7 +104,9 @@ pub async fn set_api_key_enabled(
     key_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    state.db.set_api_key_enabled(&key_id, enabled)
+    state
+        .db
+        .set_api_key_enabled(&key_id, enabled)
         .map_err(|e| e.to_string())
 }
 
@@ -105,7 +116,10 @@ pub async fn clear_api_key_penalty(
     state: State<'_, AppState>,
     key_id: String,
 ) -> Result<(), String> {
-    state.db.clear_api_key_penalty(&key_id).map_err(|e| e.to_string())
+    state
+        .db
+        .clear_api_key_penalty(&key_id)
+        .map_err(|e| e.to_string())
 }
 
 /// 预览选线序列：按 upstream_type + model 铺平候选，供 UI 展示当前生效顺序。
@@ -117,6 +131,8 @@ pub async fn preview_route_candidates(
 ) -> Result<Vec<RouteCandidate>, String> {
     let upstream = UpstreamType::parse(&upstream_type)
         .ok_or_else(|| AppError::Config(format!("未知上游类型: {upstream_type}")).to_string())?;
-    state.db.select_route_candidates(upstream, model.as_deref())
+    state
+        .db
+        .select_route_candidates(upstream, model.as_deref())
         .map_err(|e| e.to_string())
 }

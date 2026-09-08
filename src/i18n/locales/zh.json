@@ -3288,6 +3288,8 @@
     "runAll": "全部签到 ({{count}})",
     "runningAll": "签到中...",
     "scheduleLabel": "每日自动签到",
+    "scheduleHint": "按本地时间执行，启动或唤醒后补执行今日任务；应用需保持运行。可在设置中开启开机自启及关闭到托盘。",
+    "lastScheduledRun": "最近自动执行日期",
     "plaintextNotice": "站点凭证以明文保存在本地数据库中，请勿在共用电脑上使用。",
     "empty": "还没有添加站点，点击「添加站点」开始。",
     "saveSuccess": "已保存",
@@ -3481,6 +3483,13 @@
     }
   },
   "apiAccess": {
+    "gateway": {
+      "title": "本地 API 网关",
+      "baseUrl": "客户端基础地址",
+      "start": "启动网关",
+      "running": "网关运行中",
+      "hint": "添加接入点不会自动改写 CLI 配置。启动网关后，将客户端 Base URL 设置为此地址；OpenAI / DeepSeek 线路支持 Chat Completions，并可供 Codex Responses 客户端调用。"
+    },
     "title": "API 接入",
     "subtitle": "PROVIDERS",
     "count": "{{count}} 个接入",

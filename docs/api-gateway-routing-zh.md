@@ -2,7 +2,7 @@
 
 本文记录「API 接入」功能的当前实现状态、设计决策与未决问题。
 
-**状态：已实现，未经真机测试。** 下方「已知风险」一节列出了尚未验证的部分。
+**状态：已补齐主要接线并加入本地 HTTP 联调。** 本文已按 2026-09-08 的修复更新；使用步骤、验证方式和剩余边界见 `readiness-review-2026-09-08-zh.md`。本地测试不等于真实付费上游和网站验收。
 
 ## 背景
 
@@ -20,14 +20,15 @@
 | 优先级字段 | 复用 `sort_index`（展示序兼任） | 独立 `priority` / `internal_priority` |
 | 路由决定时机 | 切换那一刻写死 | 每个请求 |
 
-**分叉判据**（`proxy/handler_context.rs` 的 `select_gateway_providers`）：查询该上游类型下有无启用的接入线路。有则走新链，无则回落老链。
+**分叉判据**（`proxy/handler_context.rs` 的 `select_gateway_providers`）：查询该兼容协议族有无启用的接入点。有则走新链，无则回落老链。配置存在但 key 不可用或模型不匹配，是网关不可用，不是未配置。
 
 因此：
 
 - API 接入页一条未配 → 全部请求走老链，行为与改造前一致
 - 只在 Claude 下配了接入 → Claude 走新链，Codex / Gemini 仍走老链
-- 接入全部停用 → 选线返回空 → 自动回落老链
-- 选线查询报错 → 返回空回落老链（网关是增量能力，其故障不应拖垮老链）
+- 接入全部停用 → 未启用该网关 → 回落老链
+- 接入启用但 key 全部不可用、模型不匹配 → 返回不可用，不回落旧账号
+- 选线查询报错 → 显式返回数据库错误，不静默改变账号与计费来源
 
 **注意**：同一上游一旦新链配了线路，老链就完全不参与，不是「新链失败再试老链」。混着走会让「当前供应商是谁」产生两个互相矛盾的答案。
 
@@ -47,7 +48,7 @@ ORDER BY e.priority ASC,                  -- 层级，越小越优先
 
 三个关键设计：
 
-**轮询不用内存计数器。** 靠 `api_keys.last_used_at` 做 LRU 排序，状态就在表里，重启不丢、无需锁。并发下两个请求可能拿到同一把 key，这是可接受的——真正的限流由上游和冷却机制兜底。这一点照搬 Aether。
+**轮询顺序持久化。** `last_used_at` 使用单调毫秒标记，兼容旧秒值在首次使用后升级。请求的查询与首选 key 预占在同一 SQLite 连接锁内完成，不必等请求结束才轮换；预览查询不修改顺序。上游额度与冷却仍独立控制。
 
 **不做「这一层全挂了吗」的判定。** 候选序列是 per-request 构建的，游标只活在这一次请求内。高优先级耗尽后自然落到低优先级；下一个请求重新从最高优先级开始排。因此降级纯临时、绝不粘滞，高优先级恢复后自动回切，不需要任何回切逻辑。
 
@@ -71,7 +72,7 @@ ORDER BY e.priority ASC,                  -- 层级，越小越优先
 | 其余 5xx | 冷却 60s | |
 | 网络层失败 | 冷却 60s | 无状态码可依据 |
 
-**429 的分岔是核心**：额度耗尽与普通限流都表现为 429，但处置完全不同。靠 body 关键词区分（`insufficient_quota`、`resource_exhausted`、`quota exceeded` 等）。
+**429 的分岔是核心**：明确的 `insufficient_quota`、账单硬限额或余额不足可标记硬状态；通用 `RESOURCE_EXHAUSTED` / `quota exceeded` 也可能只是每分钟限流，不会据此永久禁用 key。`Retry-After` 支持秒数与 HTTP-date，并限制最大冷却。
 
 冷却上限 1 小时，防止上游给出畸形的超大 `retry-after` 把 key 永久闲置。
 
@@ -93,6 +94,8 @@ ORDER BY e.priority ASC,                  -- 层级，越小越优先
 
 同时冗余写入顶层 `base_url` 与 `api_key`，覆盖 adapter 的回退分支。
 
+同时写入 `api_format`：OpenAI / DeepSeek 为 `openai_chat`，Codex 为 `openai_responses`，以便 Responses 客户端正确触发 Chat 转换。
+
 两个刻意的选择：
 
 - **id 用 `gw:` + key_id**，不是 endpoint_id。轮询和判罚都发生在 key 粒度，熔断器、健康度、用量都该落在这一层。
@@ -100,57 +103,53 @@ ORDER BY e.priority ASC,                  -- 层级，越小越优先
 
 ## 哪些 app 不走网关
 
-`gateway_upstream_for` 只映射 `Claude` / `Codex` / `Gemini`。
+`gateway_upstreams_for` 只映射 `Claude` / `Codex` / `Gemini`。Codex 请求可使用 Codex、OpenAI、DeepSeek 三类接入点；Claude 与 Gemini 分别选择原生协议族。
 
-排除 OpenClaw、Hermes、Pi、GrokBuild、OpenCode：这些是 **OAuth / 托管账号**，不是 key。轮询的前提是「候选彼此等价，随便挑一个都能完成请求」，而账号绑定着自己的会话和配额，轮询到另一个账号意味着对话中途换人——上下文断裂、配额算错账。原代码对此有明确注释（`proxy/provider_router.rs` 的 `provider_supports_failover`）：复用入站 token 打到另一张账号卡上会跨越账号边界。
+OpenClaw、Hermes、Pi、GrokBuild、OpenCode 的专有接管命名空间暂不进入新链。这不代表这些客户端只能使用 OAuth：其中一些同样支持 API Key，也可以按协议手动指向通用网关入口。当前映射反映的是本轮接线范围，而不是这些客户端的完整能力。
 
-这不是「暂未实现」，是语义上就不该轮询。它们要的是「固定用这个账号，坏了报错让我重新登录」。
+多 OAuth 账号轮询是可以设计的，但不能直接套用 API Key 的 LRU：需要独立的账号刷新、会话粘性、`previous_response_id` 等有状态请求的归属处理，以及失败时的跨账号切换边界。当前仍保持固定账号；这是一项尚未实现的能力，而不是宣称 OAuth 天然不能轮询。
 
 排除 `ClaudeDesktop` 的理由不同：它协议与 Claude 相同，但走独立的 `/claude-desktop/*` 命名空间与独立鉴权，并入会打错路由。
 
-判据一句话：**能填 API key 的走网关轮询，靠账号登录的不走。**
+判据：**按请求入口与上游协议确定路由范围；通用网关做 key 轮询，专有账号接管仍走旧链。**
 
 ## 与故障转移的冲突
 
 `proxy/failover_switch.rs` 的 `FailoverSwitchManager::try_switch` 在故障转移成功后会**真的改写数据库里的 current provider**、重建托盘菜单、发 `provider-switched` 事件。
 
-在新模型里，轮询到第二条线路是**常态而非状态变更**。照原样会导致 current 被反复改写、UI 抖动。已在 `forwarder.rs` 的主成功路径用 `is_gateway_provider` 短路。
+在新模型里，轮询到第二条线路是**常态而非状态变更**。所有成功路径（含媒体、签名和 budget 重试）统一阻止旧供应商切换，并统一记录 key 成功；synthetic provider 不写旧 provider 健康表。
+
+网关重试不依赖旧供应商的自动故障转移开关，但仍受 `max_retries + 1` 的单次请求尝试上限控制。
 
 ## 已知风险
 
 按严重程度排列。
 
-**1. 尚未真机验证。** 全部结论来自单元测试与代码静态分析。以下路径**从未跑过真实请求**：合成 Provider 能否被各 adapter 正确消费、选线分叉在真实流量下是否按预期回落、判罚写库是否与流式响应的生命周期冲突。
+**1. 真实上游尚待用户配置验收。** 已使用回环 HTTP 服务验证 adapter 凭据、轮询、失败降级、模型过滤、Responses 转换与流式请求，但没有使用真实账号调用付费上游。
 
-**2. 媒体重试路径的 `try_switch` 未短路。** `forwarder.rs` 有三处额外的成功路径（图片降级重试、整流器重试等），其中的 `try_switch` 调用尚未加 `is_gateway_provider` 判断。触发条件是网关线路遇到图片输入被拒后重试成功——此时可能仍会改写 current provider。
+**2. OAuth 账号仍是固定绑定。** 新网关轮询的是 API Key，不会自动把网页登录账号变成可轮换池。
 
-**3. `retry-after` 精度丢失。** 该响应头没有保留在 `ProxyError` 里，判罚时拿不到，429 因此走默认 300 秒冷却而非上游给的精确值。可接受的降级，但上游若要求更短的等待，会造成不必要的闲置。
+**3. 局域网认证未新增。** 默认本机监听；没有把通过本地回环测试解释成可以公开暴露的网关。
 
-**4. token / cost 未落到 key 记账。** `record_api_key_success` 传 0，用量统计由 `proxy_request_logs` 那条链负责。因此接入页上的 key 统计只有请求数与成败数，没有 token 与成本。这是为避免双计的刻意选择。
+**4. token / cost 未落到 key 记账。** `record_api_key_success` 传 0，用量仍由 `proxy_request_logs` 统计。key 统计目前是请求/成败维度，不是完整的 key 级计费报表。
 
-**5. 熔断器仍是 provider 粒度。** 熔断器 key 是 `app_type:provider_id`，网关链传入的是 `gw:{key_id}`，所以实际上已经是 key 粒度——但 `provider_health` 表的主键、`proxy_request_logs.provider_id` 也会写入这个合成 id，与老链的真实 provider id 混在同一列。查询与统计时需要靠 `gw:` 前缀区分，目前没有任何地方做这个区分。
+**5. 网关健康状态由 key 表管理。** 不再与旧 provider 熔断器重复判罚；请求日志仍以 `gw:{key_id}` 标识，需要在未来的 key 级报表里明确区分。
 
 ## 未决设计：轮询与固定指定
 
 当前 `api_endpoints` 表**没有**策略字段，选线恒为轮询。
 
-需求是同时支持「多账号轮询」与「固定指定单个账号」。这两者不是对立功能——固定指定就是候选序列长度为 1 的轮询。Aether 的做法是共用同一句查询，只把 `last_used_at ASC` 翻成 `DESC`，从「挑最久没用的」变成「黏住刚用过的」。
+后续若增加策略，必须区分三种语义：`rotate` 轮换、`sticky` 优先复用且失败可以迁移、`pinned` 严格指定目标且失败不换。简单把 LRU 的 `ASC` 翻成 `DESC` 只能近似粘性，并不等于严格固定目标。
 
-实现路径（未动工）：
-
-1. `api_endpoints` 加 `strategy TEXT NOT NULL DEFAULT 'rotate'`，取值 `rotate` / `pinned`
-2. 迁移到 `SCHEMA_VERSION = 21`
-3. 选线 SQL 按策略切排序方向
-4. 接入页加模式开关
-
-这样 Claude 可以走轮询、Codex 固定某个号，互不干扰，粒度比「在设置里配一个全局的单供应商」更细。
+本轮没有为未确认的策略需求新增数据库字段或提升 schema。仅需固定一个 API Key 时，可以只启用这一把 key；有状态 OAuth 多账号策略需单独实现。
 
 ## 测试覆盖
 
-| 文件 | 测试数 | 覆盖的不变量 |
-|---|---|---|
-| `database/dao/api_gateway.rs` | 10 | 层级压过 LRU、同层按最久未用轮询且记账后指针前移、冷却自动回归而硬状态不会、停用项排除、上游与模型作用域隔离、级联删除、明文 key 不出现在序列化输出 |
-| `database/dao/api_gateway_penalty.rs` | 9 | 客户端错误不判罚、401 标记失效、`retry-after` 采纳与上限、额度耗尽优先于限流、封号与临时限制区分 |
-| `proxy/gateway_route.rs` | 6 | 三个上游的凭据落点、合成 Provider 可识别且携带 key_id、不获得 official 特权、显示名脱敏 |
+| 文件 | 覆盖的不变量 |
+|---|---|
+| `database/dao/api_gateway.rs` | 层级优先、预占轮换、预览只读、并发判罚保留、作用域隔离、级联删除和 key 脱敏 |
+| `database/dao/api_gateway_penalty.rs` | 客户端错误、401、明确余额耗尽、普通配额限制、Retry-After 秒数与 HTTP-date |
+| `proxy/gateway_route.rs` | 凭据与协议落点、synthetic id、不获得 official 特权和显示名脱敏 |
+| `proxy/gateway_tests.rs` | 实际回环 HTTP 请求的轮询、降级、模型发现/过滤、协议转换、流式/媒体重试及 HTTP/SOCKS 出口 |
 
-`cargo test --lib` 全量 2854 passed / 6 failed。那 6 个失败在 `model_pricing`、`provider`、`skill`，与本功能零关联（这些文件完全不提 `api_gateway`），单独运行也失败，属既有的测试环境依赖问题。
+不要仅根据失败文件名判断“与功能无关”。本轮进一步定位到 Windows 测试目录回退真实配置的问题，以及固定测试端口与运行中应用冲突的问题，并补上对应修复。请用隔离验证脚本运行，最终数量见本轮可用性检查报告。

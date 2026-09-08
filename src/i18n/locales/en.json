@@ -3288,6 +3288,8 @@
     "runAll": "Check in all ({{count}})",
     "runningAll": "Checking in...",
     "scheduleLabel": "Daily auto check-in",
+    "scheduleHint": "Runs in local time and catches up after startup or resume. Keep the app running; enable launch at login and close to tray in Settings if needed.",
+    "lastScheduledRun": "Last automatic run date",
     "plaintextNotice": "Site credentials are stored unencrypted in the local database. Avoid using this on a shared computer.",
     "empty": "No sites yet. Click \"Add site\" to start.",
     "saveSuccess": "Saved",
@@ -3481,6 +3483,13 @@
     }
   },
   "apiAccess": {
+    "gateway": {
+      "title": "Local API gateway",
+      "baseUrl": "Client base URL",
+      "start": "Start gateway",
+      "running": "Gateway running",
+      "hint": "Adding endpoints does not rewrite CLI settings. Start the gateway and set your client's base URL to this address. OpenAI / DeepSeek routes support Chat Completions and Codex Responses clients."
+    },
     "title": "API Access",
     "subtitle": "PROVIDERS",
     "count": "{{count}} endpoints",

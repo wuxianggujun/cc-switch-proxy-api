@@ -224,9 +224,7 @@ pub fn client_for_proxy(proxy_url: &str) -> Result<Client, String> {
 
     if let Ok(mut map) = cache.write() {
         if map.len() >= MAX_CACHED_NODE_CLIENTS {
-            log::info!(
-                "[ProxyPool] 节点客户端缓存达上限 {MAX_CACHED_NODE_CLIENTS}，清空重建"
-            );
+            log::info!("[ProxyPool] 节点客户端缓存达上限 {MAX_CACHED_NODE_CLIENTS}，清空重建");
             map.clear();
         }
         map.insert(proxy_url.to_string(), client.clone());

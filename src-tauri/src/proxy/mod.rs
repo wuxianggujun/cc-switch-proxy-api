@@ -12,6 +12,8 @@ pub mod error_mapper;
 pub(crate) mod failover_switch;
 mod forwarder;
 pub mod gateway_route;
+#[cfg(test)]
+mod gateway_tests;
 pub mod gemini_url;
 pub mod handler_config;
 pub mod handler_context;

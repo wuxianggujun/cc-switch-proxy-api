@@ -262,8 +262,7 @@ export function ProxyPoolPanel() {
                   <div className="ml-auto flex items-center gap-1.5">
                     <Switch
                       checked={sub.enabled}
-                      // inline 订阅的正文不下发，回传会把它清空，故禁用开关
-                      disabled={sub.source === "inline" || updateSub.isPending}
+                      disabled={updateSub.isPending}
                       onCheckedChange={(enabled) =>
                         updateSub.mutate({ ...sub, enabled })
                       }
