@@ -7,7 +7,7 @@
 //! 认证有三条路径：
 //! - `Header`：直接带 Cookie 或 Token（简单，但会过期）
 //! - `Login`：先用账密登录拿 Set-Cookie，再带着 cookie 发签到请求
-//! - `Browser`：开真实 WebView 过 Cloudflare 挑战，取 `cf_clearance` 后复用
+//! - `Browser`：每条条目独立浏览器 profile，分别读取账号 Cookie 与 Cloudflare 凭证
 //!
 //! `Browser` 是唯一能过 CF 的方式：CF 校验浏览器运行时与 TLS 指纹，
 //! 伪装请求头无效。它同时避免把站点密码落库，安全性优于 `Login`。
@@ -17,6 +17,7 @@
 
 pub mod browser;
 pub mod executor;
+pub mod profile;
 pub mod runner;
 pub mod scheduler;
 
@@ -32,7 +33,7 @@ pub enum CheckinAuthKind {
     Header,
     /// 先账密登录换取 session cookie。
     Login,
-    /// 开真实 WebView 过 Cloudflare 挑战，取 cf_clearance 后复用。
+    /// 从条目独立 profile 读取账号 Cookie，必要时过 Cloudflare 挑战。
     Browser,
 }
 
@@ -82,13 +83,16 @@ fn default_json_body() -> CheckinBodyKind {
 }
 
 /// 浏览器过闸配置（`auth_kind == Browser` 时使用）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckinBrowser {
     /// 用于过闸的页面地址。留空则回退到 `site_url`，再退到签到请求 URL。
     /// 单独可配是因为部分站点的 CF 挑战只在特定页面触发。
     #[serde(default)]
     pub challenge_url: String,
+    /// 独立账号窗口的登录地址。留空使用 site_url，再退到签到 URL 的站点根地址。
+    #[serde(default)]
+    pub login_url: String,
     /// 上次过闸拿到的 cookie 与 UA，供下次直接复用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached: Option<CheckinClearance>,
@@ -167,6 +171,21 @@ pub struct CheckinResult {
     /// 展示给用户的信息：站点返回的 message，或网络错误原因。
     #[serde(default)]
     pub message: String,
+    /// 登录失效仍是 Failed，而不是 Cloudflare Blocked 或网络 Error。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub needs_login: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// 只向前端返回状态，不返回独立 profile 中的账号 Cookie。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckinBrowserSessionStatus {
+    pub account_cookie_count: usize,
+    pub login_window_open: bool,
 }
 
 /// 一个公益站条目。
@@ -197,6 +216,25 @@ fn default_true() -> bool {
 }
 
 impl CheckinSite {
+    pub fn resolve_login_url(&self) -> Result<url::Url, String> {
+        if let Some(configured) = self
+            .browser
+            .as_ref()
+            .map(|browser| browser.login_url.trim())
+            .filter(|url| !url.is_empty())
+        {
+            return parse_browser_url(configured);
+        }
+        if !self.site_url.trim().is_empty() {
+            return parse_browser_url(&self.site_url);
+        }
+        let mut url = parse_browser_url(&self.request.url)?;
+        url.set_path("/");
+        url.set_query(None);
+        url.set_fragment(None);
+        Ok(url)
+    }
+
     /// 过闸目标页：优先 `browser.challenge_url`，其次站点主页，最后签到请求 URL。
     ///
     /// 回退到请求 URL 是保底——CF 挑战通常在页面导航时触发，而签到接口多为
@@ -288,20 +326,25 @@ impl CheckinService {
             site.id = uuid::Uuid::new_v4().to_string();
         }
 
+        // 缓存仅由后端写入。条目或目标 origin 变化后不能沿用旧站点的凭证。
+        let cached = config
+            .sites
+            .iter()
+            .find(|previous| same_browser_binding(previous, &site))
+            .and_then(|previous| previous.browser.as_ref())
+            .and_then(|browser| browser.cached.clone());
+        if site.auth_kind == CheckinAuthKind::Browser {
+            site.browser
+                .get_or_insert_with(CheckinBrowser::default)
+                .cached = cached;
+        } else {
+            site.browser = None;
+        }
+
         match config.sites.iter().position(|s| s.id == site.id) {
             Some(index) => {
                 site.last_result = config.sites[index].last_result.clone();
                 site.sort_index = config.sites[index].sort_index;
-                // 过闸凭证同 last_result，由执行流程维护：前端提交表单时
-                // 不带 cached，不能因此把已有凭证冲掉。
-                if let Some(browser) = site.browser.as_mut() {
-                    if browser.cached.is_none() {
-                        browser.cached = config.sites[index]
-                            .browser
-                            .as_ref()
-                            .and_then(|b| b.cached.clone());
-                    }
-                }
                 config.sites[index] = site.clone();
             }
             None => {
@@ -350,6 +393,7 @@ impl CheckinService {
     }
 
     /// 写回过闸凭证，供下次签到复用。站点可能已被并发删除，静默跳过。
+    #[allow(dead_code)]
     pub fn record_clearance(
         state: &AppState,
         id: &str,
@@ -357,16 +401,39 @@ impl CheckinService {
     ) -> Result<(), AppError> {
         let _guard = lock_config(state)?;
         let mut config = Self::load(state)?;
-        if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
+        if let Some(site) = config
+            .sites
+            .iter_mut()
+            .find(|s| s.id == id && s.auth_kind == CheckinAuthKind::Browser)
+        {
             site.browser
-                .get_or_insert_with(|| CheckinBrowser {
-                    challenge_url: String::new(),
-                    cached: None,
-                })
+                .get_or_insert_with(CheckinBrowser::default)
                 .cached = Some(clearance);
             Self::save(state, &config)?;
         }
         Ok(())
+    }
+
+    /// Do not attach an in-flight browser result to an entry whose origin/auth changed.
+    pub(super) fn record_clearance_if_current(
+        state: &AppState,
+        expected: &CheckinSite,
+        clearance: CheckinClearance,
+    ) -> Result<bool, AppError> {
+        let _guard = lock_config(state)?;
+        let mut config = Self::load(state)?;
+        let Some(site) = config
+            .sites
+            .iter_mut()
+            .find(|site| same_browser_binding(site, expected))
+        else {
+            return Ok(false);
+        };
+        site.browser
+            .get_or_insert_with(CheckinBrowser::default)
+            .cached = Some(clearance);
+        Self::save(state, &config)?;
+        Ok(true)
     }
 
     /// 丢弃过闸凭证。签到被判定为遭 CF 拦截时调用，下次强制重新过闸。
@@ -420,6 +487,7 @@ impl CheckinService {
         }
 
         if site.auth_kind == CheckinAuthKind::Browser {
+            site.resolve_login_url().map_err(AppError::InvalidInput)?;
             // challenge_url 可留空（回退到 site_url / 请求 URL），但填了就必须合法。
             if let Some(browser) = site.browser.as_ref() {
                 let raw = browser.challenge_url.trim();
@@ -459,6 +527,32 @@ fn is_http_url(url: &str) -> bool {
     })
 }
 
+pub(super) fn parse_browser_url(raw: &str) -> Result<url::Url, String> {
+    if !is_http_url(raw) {
+        return Err("浏览器页面必须是有效的 HTTP/HTTPS URL，且不能包含用户名或密码".into());
+    }
+    url::Url::parse(raw.trim()).map_err(|_| "浏览器页面 URL 无效".into())
+}
+
+pub(super) fn same_browser_binding(left: &CheckinSite, right: &CheckinSite) -> bool {
+    let same_origin = |left: &str, right: &str| {
+        parse_browser_url(left)
+            .ok()
+            .zip(parse_browser_url(right).ok())
+            .is_some_and(|(left, right)| left.origin() == right.origin())
+    };
+    left.id == right.id
+        && left.auth_kind == CheckinAuthKind::Browser
+        && right.auth_kind == CheckinAuthKind::Browser
+        && same_origin(&left.request.url, &right.request.url)
+        && same_origin(left.resolve_challenge_url(), right.resolve_challenge_url())
+        && left
+            .resolve_login_url()
+            .ok()
+            .zip(right.resolve_login_url().ok())
+            .is_some_and(|(left, right)| left.origin() == right.origin())
+}
+
 fn lock_config(state: &AppState) -> Result<std::sync::MutexGuard<'_, ()>, AppError> {
     state
         .checkin_runtime
@@ -493,6 +587,7 @@ mod tests {
             login: None,
             browser: Some(CheckinBrowser {
                 challenge_url: challenge_url.to_string(),
+                login_url: String::new(),
                 cached: None,
             }),
             request: CheckinRequest {
@@ -583,6 +678,7 @@ mod tests {
         edited.name = "改名后".to_string();
         edited.browser = Some(CheckinBrowser {
             challenge_url: "https://a.example/verify".to_string(),
+            login_url: String::new(),
             cached: None,
         });
         CheckinService::upsert_site(&state, edited).expect("update site");
@@ -630,5 +726,95 @@ mod tests {
 
         let bad = browser_site("example.com/verify", "", "https://c.example/api");
         assert!(CheckinService::validate(&bad).is_err());
+    }
+
+    #[test]
+    fn profile_b_changing_request_origin_invalidates_cached_clearance() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let saved = CheckinService::upsert_site(
+            &state,
+            browser_site("https://a.example", "", "https://a.example/checkin"),
+        )
+        .unwrap();
+        CheckinService::record_clearance(&state, &saved.id, clearance(1_700_000_000)).unwrap();
+        let mut edited = saved;
+        edited.request.url = "https://b.example/checkin".into();
+        let updated = CheckinService::upsert_site(&state, edited).unwrap();
+        assert!(updated.browser.unwrap().cached.is_none());
+    }
+
+    #[test]
+    fn profile_b_imported_clearance_cannot_select_another_entry_session() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let mut imported = browser_site("https://a.example", "", "https://a.example/checkin");
+        imported.browser.as_mut().unwrap().cached = Some(clearance(1_700_000_000));
+        let saved = CheckinService::upsert_site(&state, imported).unwrap();
+        assert!(saved.browser.unwrap().cached.is_none());
+    }
+
+    #[test]
+    fn profile_b_login_url_roundtrips_through_saved_configuration() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let mut value = serde_json::to_value(browser_site(
+            "https://a.example",
+            "",
+            "https://a.example/checkin",
+        ))
+        .unwrap();
+        value["browser"]["loginUrl"] = serde_json::json!("https://a.example/login");
+        let saved =
+            CheckinService::upsert_site(&state, serde_json::from_value(value).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(saved).unwrap()["browser"]["loginUrl"],
+            "https://a.example/login"
+        );
+    }
+
+    #[test]
+    fn profile_b_login_url_defaults_to_site_root_without_api_path_or_query() {
+        let mut site = browser_site(
+            "",
+            "",
+            "https://same.example/api/checkin?token=secret#fragment",
+        );
+        assert_eq!(
+            site.resolve_login_url().unwrap().as_str(),
+            "https://same.example/"
+        );
+        site.site_url = "https://same.example/dashboard".into();
+        assert_eq!(
+            site.resolve_login_url().unwrap().as_str(),
+            "https://same.example/dashboard"
+        );
+        site.browser.as_mut().unwrap().login_url = "https://same.example/login".into();
+        assert_eq!(
+            site.resolve_login_url().unwrap().as_str(),
+            "https://same.example/login"
+        );
+        site.browser.as_mut().unwrap().login_url = "https://user:password@same.example/".into();
+        assert!(CheckinService::validate(&site).is_err());
+    }
+
+    #[test]
+    fn profile_b_late_clearance_cannot_repopulate_an_edited_or_deleted_entry() {
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let saved = CheckinService::upsert_site(
+            &state,
+            browser_site("https://a.example", "", "https://a.example/api"),
+        )
+        .unwrap();
+        let mut edited = saved.clone();
+        edited.auth_kind = CheckinAuthKind::Header;
+        CheckinService::upsert_site(&state, edited).unwrap();
+        assert!(
+            !CheckinService::record_clearance_if_current(&state, &saved, clearance(1)).unwrap()
+        );
+        assert!(CheckinService::load(&state).unwrap().sites[0]
+            .browser
+            .is_none());
+        CheckinService::delete_site(&state, &saved.id).unwrap();
+        assert!(
+            !CheckinService::record_clearance_if_current(&state, &saved, clearance(1)).unwrap()
+        );
     }
 }

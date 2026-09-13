@@ -58,24 +58,25 @@ import { Sidebar } from "@/components/sidebar/Sidebar";
 import { ProfileSwitcher } from "@/components/profiles/ProfileSwitcher";
 import { HomePage } from "@/components/home/HomePage";
 import { ApiAccessPage } from "@/components/apiAccess/ApiAccessPage";
+import { RequestLogsPage } from "@/components/requestLogs/RequestLogsPage";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
-import { UpdateBadge } from "@/components/UpdateBadge";
 import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
 import { ProxyToggle } from "@/components/proxy/ProxyToggle";
 import { ClaudeDesktopRouteToggle } from "@/components/proxy/ClaudeDesktopRouteToggle";
 import { FailoverToggle } from "@/components/proxy/FailoverToggle";
-import { RoutingActivationBrand } from "@/components/proxy/RoutingActivationBrand";
 import UsageScriptModal from "@/components/UsageScriptModal";
 import UnifiedMcpPanel from "@/components/mcp/UnifiedMcpPanel";
 import {
   getAppsForView,
   isNavViewAvailable,
+  isProviderTabView,
   type NavViewId,
 } from "@/config/navConfig";
+import { ProviderViewTabs } from "@/components/providers/ProviderViewTabs";
 import PromptPanel, {
   type PromptPanelHandle,
   type PromptPrimaryAction,
@@ -117,6 +118,7 @@ import {
 type View =
   | "home"
   | "apiAccess"
+  | "requestLogs"
   | "providers"
   | "settings"
   | "prompts"
@@ -160,6 +162,7 @@ const VIEW_STORAGE_KEY = "cc-switch-last-view";
 const VALID_VIEWS: View[] = [
   "home",
   "apiAccess",
+  "requestLogs",
   "providers",
   "settings",
   "prompts",
@@ -200,6 +203,9 @@ function App() {
   const [skillsDiscoverySource, setSkillsDiscoverySource] =
     useState<SkillsPageSource>("repos");
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
+  const [requestLogsMode, setRequestLogsMode] = useState<"traces" | "usage">(
+    "traces",
+  );
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
@@ -1015,6 +1021,14 @@ function App() {
   const showBackButton =
     currentView === "settings" || currentView === "skillsDiscovery";
 
+  // skillsDiscovery 是 skills 的子页，自带返回键，不再挂标签栏。
+  const providerTabView: NavViewId | null =
+    currentView !== "settings" &&
+    currentView !== "skillsDiscovery" &&
+    isProviderTabView(currentView as NavViewId)
+      ? (currentView as NavViewId)
+      : null;
+
   // 应用已降为侧边栏子项，标题需要标出当前操作的是哪个应用。
   // global 功能（统一供应商 / 智能体）与设置页无应用归属。
   const viewAppLabel = useMemo(() => {
@@ -1033,6 +1047,8 @@ function App() {
         return t("nav.home");
       case "apiAccess":
         return t("nav.apiAccess");
+      case "requestLogs":
+        return t("nav.requestLogs");
       case "settings":
         return t("settings.title");
       case "prompts":
@@ -1071,9 +1087,28 @@ function App() {
     const content = (() => {
       switch (currentView) {
         case "home":
-          return <HomePage />;
+          return (
+            <HomePage
+              onOpenApiAccess={() => setCurrentView("apiAccess")}
+              onOpenTraces={() => {
+                setRequestLogsMode("traces");
+                setCurrentView("requestLogs");
+              }}
+              onOpenUsage={() => {
+                setRequestLogsMode("usage");
+                setCurrentView("requestLogs");
+              }}
+            />
+          );
         case "apiAccess":
           return <ApiAccessPage />;
+        case "requestLogs":
+          return (
+            <RequestLogsPage
+              key={requestLogsMode}
+              initialMode={requestLogsMode}
+            />
+          );
         case "settings":
           return (
             <SettingsPage
@@ -1340,7 +1375,10 @@ function App() {
                 : (currentView as NavViewId)
           }
           visibleApps={visibleApps}
-          onSelectView={setCurrentView}
+          onSelectView={(view) => {
+            if (view === "requestLogs") setRequestLogsMode("traces");
+            setCurrentView(view);
+          }}
           onSelectApp={handleSelectAppForView}
           onOpenSettings={() => {
             setSettingsDefaultTab("general");
@@ -1405,27 +1443,13 @@ function App() {
                 </h1>
                 {currentView === "providers" && (
                   <div className="ml-2 flex items-center gap-2">
-                    <RoutingActivationBrand
-                      active={isProxyRunning && isCurrentAppTakeoverActive}
-                      contextKey={activeApp}
-                      ready={
-                        proxyStatus !== undefined &&
-                        takeoverStatus !== undefined
-                      }
-                    />
-                    <UpdateBadge
-                      onClick={() => {
-                        setSettingsDefaultTab("about");
-                        setCurrentView("settings");
-                      }}
-                    />
                     {isCurrentAppTakeoverActive && (
                       <Button
                         variant="ghost"
                         size="icon"
                         onClick={() => {
-                          setSettingsDefaultTab("usage");
-                          setCurrentView("settings");
+                          setRequestLogsMode("usage");
+                          setCurrentView("requestLogs");
                         }}
                         title={t("usage.title", {
                           defaultValue: "使用统计",
@@ -1651,6 +1675,17 @@ function App() {
               </div>
             </div>
           </header>
+
+          {providerTabView && (
+            <div className="shrink-0 px-6 pb-3">
+              <ProviderViewTabs
+                featureApp={sharedFeatureApp}
+                currentView={providerTabView}
+                onSelectView={setCurrentView}
+                disabled={managementBusy}
+              />
+            </div>
+          )}
 
           <main className="flex-1 min-h-0 flex flex-col overflow-y-auto pb-4 animate-fade-in">
             {isOpenClawView && openclawHealthWarnings.length > 0 && (

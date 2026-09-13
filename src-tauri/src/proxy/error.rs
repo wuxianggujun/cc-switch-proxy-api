@@ -79,6 +79,59 @@ pub enum ProxyError {
     Internal(String),
 }
 
+impl ProxyError {
+    /// The error envelope follows the client protocol, not the selected upstream.
+    pub(crate) fn into_anthropic_response(self) -> Response {
+        let status = StatusCode::from_u16(super::error_mapper::map_proxy_error_to_status(&self))
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let category = match status.as_u16() {
+            400 | 404 | 405 | 413 | 422 => "invalid_request_error",
+            401 => "authentication_error",
+            403 => "permission_error",
+            429 => "rate_limit_error",
+            503 | 529 => "overloaded_error",
+            _ => "api_error",
+        };
+        let mut detail = match &self {
+            Self::UpstreamError {
+                body: Some(body), ..
+            } => serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .filter(|error| error.is_object())
+                        .cloned()
+                }),
+            _ => None,
+        }
+        .unwrap_or_else(|| json!({}));
+        if !detail
+            .get("message")
+            .is_some_and(serde_json::Value::is_string)
+        {
+            detail["message"] = json!(super::error_mapper::get_error_message(&self));
+        }
+        let kind = detail.get("type").and_then(serde_json::Value::as_str);
+        if !matches!(
+            kind,
+            Some(
+                "invalid_request_error"
+                    | "authentication_error"
+                    | "permission_error"
+                    | "not_found_error"
+                    | "request_too_large"
+                    | "rate_limit_error"
+                    | "api_error"
+                    | "overloaded_error"
+            )
+        ) {
+            detail["type"] = json!(category);
+        }
+        (status, Json(json!({"type":"error","error":detail}))).into_response()
+    }
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let (status, body) = match &self {

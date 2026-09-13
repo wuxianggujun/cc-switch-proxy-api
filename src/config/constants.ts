@@ -1,3 +1,9 @@
+/**
+ * 本地路由服务默认监听端口，必须与 Rust 侧 `config::DEFAULT_LISTEN_PORT` 一致。
+ * 与上游 cc-switch 的 15721 错开，避免两个程序同时运行时抢占同一端口。
+ */
+export const DEFAULT_LISTEN_PORT = 15722;
+
 // Provider 类型常量
 export const PROVIDER_TYPES = {
   GITHUB_COPILOT: "github_copilot",

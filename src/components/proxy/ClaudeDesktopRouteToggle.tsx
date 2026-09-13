@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { Switch } from "@/components/ui/switch";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
+import { DEFAULT_LISTEN_PORT } from "@/config/constants";
 import { cn } from "@/lib/utils";
 
 interface ClaudeDesktopRouteToggleProps {
@@ -31,7 +32,7 @@ export function ClaudeDesktopRouteToggle({
       takeoverStatus?.grokbuild,
   );
   const routeAddress = status?.address ?? "127.0.0.1";
-  const routePort = status?.port ?? 15721;
+  const routePort = status?.port ?? DEFAULT_LISTEN_PORT;
 
   const handleToggle = async (checked: boolean) => {
     try {

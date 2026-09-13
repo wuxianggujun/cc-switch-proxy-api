@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiGatewayApi } from "@/lib/api/apiGateway";
 import type {
-  ApiEndpoint,
-  NewApiEndpoint,
+  NewApiEndpointWithKey,
   NewApiKey,
+  UpdateApiEndpointInput,
   UpstreamType,
 } from "@/types/apiGateway";
 
@@ -43,7 +43,9 @@ export function useRouteCandidates(
 }
 
 /** 所有写操作共用：整棵子树失效。接入点与密钥的计数相互影响，分开失效容易漏。 */
-function useGatewayMutation<TArgs>(fn: (args: TArgs) => Promise<unknown>) {
+function useGatewayMutation<TResult, TArgs>(
+  fn: (args: TArgs) => Promise<TResult>,
+) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: fn,
@@ -54,14 +56,14 @@ function useGatewayMutation<TArgs>(fn: (args: TArgs) => Promise<unknown>) {
 }
 
 export function useCreateApiEndpoint() {
-  return useGatewayMutation((endpoint: NewApiEndpoint) =>
-    apiGatewayApi.createEndpoint(endpoint),
+  return useGatewayMutation((input: NewApiEndpointWithKey) =>
+    apiGatewayApi.createEndpoint(input),
   );
 }
 
 export function useUpdateApiEndpoint() {
-  return useGatewayMutation((endpoint: ApiEndpoint) =>
-    apiGatewayApi.updateEndpoint(endpoint),
+  return useGatewayMutation((input: UpdateApiEndpointInput) =>
+    apiGatewayApi.updateEndpoint(input),
   );
 }
 

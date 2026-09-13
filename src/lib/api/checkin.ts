@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  CheckinBrowserSessionStatus,
   CheckinConfig,
   CheckinResult,
   CheckinSite,
@@ -13,6 +14,18 @@ import type {
  * 与仓库既有的 S3 secret_access_key 一致 —— 面板需向用户明示。
  */
 export const checkinApi = {
+  /** 打开当前条目的独立登录窗口；不会等待用户完成登录。 */
+  async openLogin(id: string): Promise<void> {
+    await invoke("open_checkin_login_window", { id });
+  },
+
+  /** 只读取 Cookie 数量及窗口状态，不传输账号 Cookie。 */
+  async getBrowserSessionStatus(
+    id: string,
+  ): Promise<CheckinBrowserSessionStatus> {
+    return await invoke("get_checkin_browser_session_status", { id });
+  },
+
   async getConfig(): Promise<CheckinConfig> {
     return await invoke("get_checkin_config");
   },

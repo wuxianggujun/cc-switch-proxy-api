@@ -4,6 +4,7 @@
 
 pub mod body_filter;
 pub mod cache_injector;
+mod chat_bridge;
 pub mod circuit_breaker;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
@@ -26,6 +27,7 @@ pub mod media_sanitizer;
 pub mod model_mapper;
 pub mod provider_router;
 pub mod providers;
+pub(crate) mod request_trace;
 pub mod response_processor;
 pub(crate) mod server;
 pub mod session;

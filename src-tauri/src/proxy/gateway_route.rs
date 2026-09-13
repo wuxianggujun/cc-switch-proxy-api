@@ -11,7 +11,7 @@
 use serde_json::json;
 
 use crate::database::{RouteCandidate, UpstreamType};
-use crate::provider::Provider;
+use crate::provider::{Provider, ProviderMeta};
 
 /// 合成 Provider 的 id 前缀。带上它便于在日志与用量记录里区分两条链。
 pub const GATEWAY_PROVIDER_PREFIX: &str = "gw:";
@@ -41,11 +41,23 @@ pub fn gateway_key_id(provider: &Provider) -> Option<&str> {
 pub fn candidate_to_provider(candidate: &RouteCandidate) -> Provider {
     let base_url = candidate.base_url.trim_end_matches('/');
     let key = candidate.api_key.as_str();
+    let full_endpoint_suffix = match candidate.upstream_type {
+        UpstreamType::Claude => "/messages",
+        UpstreamType::Openai | UpstreamType::Deepseek => "/chat/completions",
+        UpstreamType::Codex => "/responses",
+        UpstreamType::Gemini => "",
+    };
+    let is_full_url = !full_endpoint_suffix.is_empty()
+        && url::Url::parse(base_url).ok().is_some_and(|url| {
+            url.path()
+                .trim_end_matches('/')
+                .ends_with(full_endpoint_suffix)
+        });
 
     let env = match candidate.upstream_type {
         UpstreamType::Claude => json!({
             "ANTHROPIC_BASE_URL": base_url,
-            "ANTHROPIC_AUTH_TOKEN": key,
+            "ANTHROPIC_API_KEY": key,
         }),
         // Codex 与 DeepSeek 都走 OpenAI 兼容那套读取路径
         UpstreamType::Openai | UpstreamType::Codex | UpstreamType::Deepseek => json!({
@@ -58,7 +70,7 @@ pub fn candidate_to_provider(candidate: &RouteCandidate) -> Provider {
         }),
     };
 
-    let settings_config = json!({
+    let mut settings_config = json!({
         "env": env,
         "base_url": base_url,
         "api_key": key,
@@ -69,6 +81,15 @@ pub fn candidate_to_provider(candidate: &RouteCandidate) -> Provider {
             UpstreamType::Gemini => "gemini_native",
         },
     });
+
+    // The entry may be Anthropic, but OpenAI-family upstreams still require
+    // Bearer authentication. Do not let the entry adapter choose x-api-key.
+    if matches!(
+        candidate.upstream_type,
+        UpstreamType::Openai | UpstreamType::Codex | UpstreamType::Deepseek
+    ) {
+        settings_config["auth_mode"] = json!("bearer_only");
+    }
 
     Provider {
         // key_id 而非 endpoint_id：熔断器、健康度、用量都该落在 key 粒度上，
@@ -83,7 +104,14 @@ pub fn candidate_to_provider(candidate: &RouteCandidate) -> Provider {
         created_at: None,
         sort_index: None,
         notes: None,
-        meta: None,
+        meta: (candidate.upstream_type == UpstreamType::Claude || is_full_url).then(|| {
+            ProviderMeta {
+                api_key_field: (candidate.upstream_type == UpstreamType::Claude)
+                    .then(|| "ANTHROPIC_API_KEY".into()),
+                is_full_url: is_full_url.then_some(true),
+                ..Default::default()
+            }
+        }),
         icon: None,
         icon_color: None,
         in_failover_queue: false,
@@ -115,7 +143,7 @@ mod tests {
         let env = &provider.settings_config["env"];
         // 尾斜杠必须去掉：adapter 自己会拼路径，重复斜杠会打到 404
         assert_eq!(env["ANTHROPIC_BASE_URL"], "https://api.example.com");
-        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "sk-secret-3IKa");
+        assert_eq!(env["ANTHROPIC_API_KEY"], "sk-secret-3IKa");
     }
 
     #[test]

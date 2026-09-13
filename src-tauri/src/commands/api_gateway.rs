@@ -6,9 +6,11 @@
 use tauri::State;
 
 use crate::database::{
-    ApiEndpointRecord, ApiKeyRecord, NewApiEndpoint, NewApiKey, RouteCandidate, UpstreamType,
+    ApiEndpointRecord, ApiKeyRecord, CreatedApiEndpoint, KeyMutationOutcome, NewApiEndpointWithKey,
+    NewApiKey, RouteCandidate, UpdateApiEndpointInput, UpdatedApiEndpoint, UpstreamType,
 };
 use crate::error::AppError;
+use crate::services::model_fetch::{self, FetchedModel};
 use crate::store::AppState;
 
 #[tauri::command]
@@ -19,24 +21,24 @@ pub async fn list_api_endpoints(
 }
 
 #[tauri::command]
-pub async fn create_api_endpoint(
+pub async fn create_api_endpoint_with_key(
     state: State<'_, AppState>,
-    endpoint: NewApiEndpoint,
-) -> Result<String, String> {
+    input: NewApiEndpointWithKey,
+) -> Result<CreatedApiEndpoint, String> {
     state
         .db
-        .create_api_endpoint(&endpoint)
+        .create_api_endpoint_with_key(&input)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn update_api_endpoint(
     state: State<'_, AppState>,
-    endpoint: ApiEndpointRecord,
-) -> Result<(), String> {
+    input: UpdateApiEndpointInput,
+) -> Result<UpdatedApiEndpoint, String> {
     state
         .db
-        .update_api_endpoint(&endpoint)
+        .update_api_endpoint(&input)
         .map_err(|e| e.to_string())
 }
 
@@ -94,7 +96,10 @@ pub async fn create_api_key(state: State<'_, AppState>, key: NewApiKey) -> Resul
 }
 
 #[tauri::command]
-pub async fn delete_api_key(state: State<'_, AppState>, key_id: String) -> Result<(), String> {
+pub async fn delete_api_key(
+    state: State<'_, AppState>,
+    key_id: String,
+) -> Result<KeyMutationOutcome, String> {
     state.db.delete_api_key(&key_id).map_err(|e| e.to_string())
 }
 
@@ -103,7 +108,7 @@ pub async fn set_api_key_enabled(
     state: State<'_, AppState>,
     key_id: String,
     enabled: bool,
-) -> Result<(), String> {
+) -> Result<KeyMutationOutcome, String> {
     state
         .db
         .set_api_key_enabled(&key_id, enabled)
@@ -135,4 +140,33 @@ pub async fn preview_route_candidates(
         .db
         .select_route_candidates(upstream, model.as_deref())
         .map_err(|e| e.to_string())
+}
+
+/// 获取尚未保存的网关表单对应模型。
+#[tauri::command]
+pub async fn fetch_api_gateway_draft_models(
+    input: GatewayModelFetchInput,
+) -> Result<Vec<FetchedModel>, String> {
+    model_fetch::fetch_gateway_models(&input.base_url, &input.api_key, input.upstream_type).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelFetchInput {
+    base_url: String,
+    api_key: String,
+    upstream_type: UpstreamType,
+}
+
+/// 用已保存接入点的启用密钥获取模型；同步数据库锁在网络 await 前已释放。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fetch_api_endpoint_models(
+    state: State<'_, AppState>,
+    endpoint_id: String,
+) -> Result<Vec<FetchedModel>, String> {
+    let config = state
+        .db
+        .get_api_endpoint_model_fetch_config(&endpoint_id)
+        .map_err(|e| e.to_string())?;
+    model_fetch::fetch_gateway_models(&config.base_url, &config.api_key, config.upstream_type).await
 }

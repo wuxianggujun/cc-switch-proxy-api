@@ -32,13 +32,16 @@ mod schema;
 mod tests;
 
 // DAO 类型导出供外部使用
+pub(crate) use dao::api_gateway::validate_endpoint_url;
 #[allow(unused_imports)]
 pub use dao::api_gateway_penalty::{
     classify_transport_failure, classify_upstream_status, KeyPenalty,
 };
+#[allow(unused_imports)]
 pub use dao::api_gateway_types::{
-    ApiEndpointRecord, ApiKeyRecord, HardState, NewApiEndpoint, NewApiKey, RouteCandidate,
-    UpstreamType,
+    ApiEndpointRecord, ApiKeyRecord, CreatedApiEndpoint, HardState, KeyMutationOutcome,
+    NewApiEndpoint, NewApiEndpointWithKey, NewApiKey, NewApiKeyValue, RouteCandidate,
+    UpdateApiEndpointInput, UpdatedApiEndpoint, UpstreamType,
 };
 pub(crate) use dao::providers_seed::{
     is_official_seed_id, CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, CODEX_OFFICIAL_PROVIDER_ID,
@@ -47,6 +50,10 @@ pub(crate) use dao::providers_seed::{
 pub(crate) use dao::proxy::{
     validate_cost_multiplier, validate_pricing_source, PRICING_SOURCE_REQUEST,
     PRICING_SOURCE_RESPONSE,
+};
+pub use dao::request_traces::{
+    RequestTraceAttempt, RequestTraceConfig, RequestTraceDetail, RequestTraceFilters,
+    RequestTracePage, RequestTraceSummary, TraceHeader, TracePayload,
 };
 pub use dao::FailoverQueueItem;
 pub use dao::Profile;
@@ -61,7 +68,7 @@ use std::sync::Mutex;
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 20;
+pub(crate) const SCHEMA_VERSION: i32 = 21;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {
@@ -157,6 +164,9 @@ impl Database {
         }
 
         // Startup cleanup: prune old logs and reclaim space
+        if let Err(e) = db.recover_request_traces() {
+            log::warn!("Startup request trace recovery failed: {e}");
+        }
         if let Err(e) = db.cleanup_old_stream_check_logs(7) {
             log::warn!("Startup stream_check_logs cleanup failed: {e}");
         }

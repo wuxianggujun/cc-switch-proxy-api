@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import {
   ChevronRight,
@@ -19,7 +19,12 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { APP_ICON_NAME, APP_IDS, getAppLabel } from "@/config/appConfig";
-import { NAV_ITEMS, getAppsForView, type NavViewId } from "@/config/navConfig";
+import {
+  NAV_ITEMS,
+  getAppsForView,
+  isProviderTabView,
+  type NavViewId,
+} from "@/config/navConfig";
 
 const APP_BADGE_ICON: Partial<
   Record<AppId, { icon: typeof Terminal; offsetY?: number }>
@@ -110,10 +115,40 @@ export function Sidebar({
 }: SidebarProps) {
   const { t } = useTranslation();
   const noDrag = { WebkitAppRegion: "no-drag" } as CSSProperties;
+  // 手动折叠的分组。展开态默认由「是否当前分组」推导，这里只记录用户显式收起的分组，
+  // 否则点当前分组无法收回（箭头会 rotate-90 暗示可收，但收不了）。
+  const [manuallyCollapsed, setManuallyCollapsed] = useState<Set<NavViewId>>(
+    () => new Set(),
+  );
+
+  const handleSelectView = (view: NavViewId, isCurrent: boolean) => {
+    // 侧边栏整体折叠时子项本就不可见，此时点当前分组不该记录折叠意图，
+    // 否则展开侧边栏后分组会莫名是收起的
+    if (isCurrent && collapsed) return;
+    if (isCurrent) {
+      setManuallyCollapsed((previous) => {
+        const next = new Set(previous);
+        if (!next.delete(view)) next.add(view);
+        return next;
+      });
+      return;
+    }
+    // 切到别的分组：清掉它的折叠标记，保持「点进去自动展开」的手感
+    setManuallyCollapsed((previous) => {
+      if (!previous.has(view)) return previous;
+      const next = new Set(previous);
+      next.delete(view);
+      return next;
+    });
+    onSelectView(view);
+  };
   // 只列当前应用支持的功能，避免 Codex 下出现 OpenClaw 专属项。
   // 跨应用切换靠功能展开后的应用子项完成。
+  // providers 组的其余成员改由供应商页顶部标签栏承载，这里只留 providers 作组入口。
   const visibleItems = NAV_ITEMS.filter(
-    (item) => !item.apps || item.apps.includes(featureApp),
+    (item) =>
+      (!item.apps || item.apps.includes(featureApp)) &&
+      (item.group !== "providers" || item.id === "providers"),
   );
 
   return (
@@ -167,17 +202,33 @@ export function Sidebar({
           )}
         >
           {visibleItems.map(({ id, labelKey, icon: Icon, scope }) => {
-            const isCurrent = currentView === id;
+            // providers 行代表整个组：停在组内任一标签（Skills / MCP…）时它都是当前项。
+            const isCurrent =
+              currentView === id ||
+              (id === "providers" &&
+                currentView !== null &&
+                isProviderTabView(currentView));
             const label = t(labelKey);
             const childApps = getAppsForView(id, visibleApps ?? {}, APP_IDS);
-            const expanded = isCurrent && !collapsed && childApps.length > 0;
+            const expanded =
+              isCurrent &&
+              !collapsed &&
+              childApps.length > 0 &&
+              !manuallyCollapsed.has(id);
+            // 在组内换应用时保留当前标签；统一供应商与应用无关，换应用要回到供应商列表。
+            const appTargetView: NavViewId =
+              currentView &&
+              getAppsForView(currentView, visibleApps ?? {}, APP_IDS).length > 0
+                ? currentView
+                : id;
 
             const row = (
               <button
                 type="button"
-                onClick={() => onSelectView(id)}
+                onClick={() => handleSelectView(id, isCurrent)}
                 disabled={disabled && !isCurrent}
                 aria-current={isCurrent ? "page" : undefined}
+                aria-expanded={childApps.length > 0 ? expanded : undefined}
                 className={cn(
                   "flex h-9 shrink-0 items-center rounded-lg text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-40",
                   // 不能用 w-full：它相对 nav 自身宽度求值，会把 nav 的 flex
@@ -228,7 +279,7 @@ export function Sidebar({
                         <button
                           key={app}
                           type="button"
-                          onClick={() => onSelectApp(app, id)}
+                          onClick={() => onSelectApp(app, appTargetView)}
                           disabled={disabled}
                           aria-current={appActive ? "true" : undefined}
                           className={cn(

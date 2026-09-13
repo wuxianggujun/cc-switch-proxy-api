@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/select";
 import { deepClone } from "@/utils/deepClone";
 import { useRefreshCheckinClearance } from "@/hooks/useCheckin";
+import { CheckinBrowserAccountControls } from "./CheckinBrowserAccountControls";
 import {
   emptyCheckinBrowser,
   emptyCheckinLogin,
@@ -98,13 +99,25 @@ export function CheckinSiteFormModal({
       login: draft.authKind === "login" ? login : undefined,
       browser:
         draft.authKind === "browser"
-          ? { challengeUrl: browser.challengeUrl }
+          ? {
+              challengeUrl: browser.challengeUrl,
+              loginUrl: browser.loginUrl ?? "",
+            }
           : undefined,
     });
   };
 
   // 已存盘的站点才有凭证可刷新：过闸需要后端按 id 读配置。
   const canRefresh = site !== null && draft.authKind === "browser";
+  const browserActionsReady =
+    open &&
+    canRefresh &&
+    Boolean(site?.id.trim()) &&
+    site?.authKind === "browser" &&
+    draft.siteUrl.trim() === site.siteUrl.trim() &&
+    draft.request.url.trim() === site.request.url.trim() &&
+    browser.challengeUrl.trim() === (site.browser?.challengeUrl ?? "").trim() &&
+    (browser.loginUrl ?? "").trim() === (site.browser?.loginUrl ?? "").trim();
   const cached = site?.browser?.cached;
   const clearanceHint = !cached
     ? t("checkin.form.clearanceNone")
@@ -122,7 +135,7 @@ export function CheckinSiteFormModal({
           <DialogDescription>{t("checkin.form.description")}</DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4 py-2">
+        <div className="space-y-4 px-6 py-4">
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label htmlFor="checkin-name">{t("checkin.form.name")}</Label>
@@ -182,6 +195,31 @@ export function CheckinSiteFormModal({
               </p>
 
               <div className="space-y-1.5">
+                <Label htmlFor="checkin-browser-login-url">
+                  {t("checkin.form.browserLoginUrl")}
+                </Label>
+                <Input
+                  id="checkin-browser-login-url"
+                  value={browser.loginUrl ?? ""}
+                  onChange={(e) =>
+                    setBrowser({ ...browser, loginUrl: e.target.value })
+                  }
+                  placeholder={draft.siteUrl || "https://example.com/login"}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("checkin.form.browserLoginUrlHint")}
+                </p>
+              </div>
+
+              <CheckinBrowserAccountControls
+                siteId={site?.id}
+                disabled={
+                  !browserActionsReady || pending || refreshClearance.isPending
+                }
+                needsLogin={site?.lastResult?.needsLogin}
+              />
+
+              <div className="space-y-1.5">
                 <Label htmlFor="checkin-challenge-url">
                   {t("checkin.form.challengeUrl")}
                 </Label>
@@ -208,7 +246,11 @@ export function CheckinSiteFormModal({
                     variant="outline"
                     size="sm"
                     onClick={() => refreshClearance.mutate(site.id)}
-                    disabled={refreshClearance.isPending}
+                    disabled={
+                      !browserActionsReady ||
+                      pending ||
+                      refreshClearance.isPending
+                    }
                   >
                     {refreshClearance.isPending ? (
                       <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />

@@ -6919,11 +6919,12 @@ model = "gpt-5.1-codex"
             Some(PROXY_TOKEN_PLACEHOLDER),
             "takeover token placeholder should be preserved"
         );
+        let expected_proxy_url = format!("http://127.0.0.1:{}", crate::config::DEFAULT_LISTEN_PORT);
         assert_eq!(
             live.get("env")
                 .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
                 .and_then(|v| v.as_str()),
-            Some("http://127.0.0.1:15721"),
+            Some(expected_proxy_url.as_str()),
             "takeover proxy URL should remain active"
         );
         assert!(
@@ -7966,13 +7967,15 @@ requires_openai_auth = true
             Some("AiHubMix"),
             "Codex app provider label should follow the selected provider"
         );
+        let expected_base_url =
+            format!("http://127.0.0.1:{}/v1", crate::config::DEFAULT_LISTEN_PORT);
         assert_eq!(
             parsed_live
                 .get("model_providers")
                 .and_then(|v| v.get("aihubmix"))
                 .and_then(|v| v.get("base_url"))
                 .and_then(|v| v.as_str()),
-            Some("http://127.0.0.1:15721/v1"),
+            Some(expected_base_url.as_str()),
             "taken-over live config should stay pointed at the local proxy"
         );
 
@@ -8108,13 +8111,15 @@ requires_openai_auth = true
                 .and_then(|v| v.as_str()),
             Some("DeepSeek")
         );
+        let expected_base_url =
+            format!("http://127.0.0.1:{}/v1", crate::config::DEFAULT_LISTEN_PORT);
         assert_eq!(
             parsed_live
                 .get("model_providers")
                 .and_then(|v| v.get("deepseek"))
                 .and_then(|v| v.get("base_url"))
                 .and_then(|v| v.as_str()),
-            Some("http://127.0.0.1:15721/v1")
+            Some(expected_base_url.as_str())
         );
         assert_eq!(
             parsed_live.get("model").and_then(|v| v.as_str()),

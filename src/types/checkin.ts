@@ -5,7 +5,7 @@
 
 /**
  * 认证方式：直接带凭证头、先账密登录换 cookie，或开真实 WebView
- * 过 Cloudflare 挑战。browser 是唯一能过 CF 的方式。
+ * 从独立浏览器 profile 读取账号 Cookie，并在需要时过 Cloudflare 挑战。
  */
 export type CheckinAuthKind = "header" | "login" | "browser";
 
@@ -45,8 +45,16 @@ export interface CheckinClearance {
 export interface CheckinBrowser {
   /** 过闸页面地址。留空则回退到 siteUrl，再退到签到请求 URL。 */
   challengeUrl: string;
+  /** 独立窗口登录页面。旧配置可省略，后端回退到站点主页/根地址。 */
+  loginUrl?: string;
   /** 上次过闸结果，由后端维护，前端提交表单时无需携带。 */
   cached?: CheckinClearance;
+}
+
+/** 后端只返回登录态元数据，不将账号 Cookie 暴露给前端。 */
+export interface CheckinBrowserSessionStatus {
+  accountCookieCount: number;
+  loginWindowOpen: boolean;
 }
 
 /**
@@ -81,6 +89,8 @@ export interface CheckinResult {
   at: number;
   httpStatus?: number;
   message: string;
+  /** 仍然属于 failed，而不是新增状态或 Cloudflare blocked。 */
+  needsLogin?: boolean;
 }
 
 export interface CheckinSite {
@@ -127,7 +137,7 @@ export function emptyCheckinSite(): CheckinSite {
 }
 
 export function emptyCheckinBrowser(): CheckinBrowser {
-  return { challengeUrl: "" };
+  return { challengeUrl: "", loginUrl: "" };
 }
 
 export function emptyCheckinLogin(): CheckinLogin {

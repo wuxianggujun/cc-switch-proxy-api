@@ -586,9 +586,15 @@ fn global_tls_connector() -> &'static tokio_rustls::TlsConnector {
         let native = rustls_native_certs::load_native_certs();
         let (added, _errors) = root_store.add_parsable_certificates(native.certs);
         log::debug!("[HyperClient] TLS root store: webpki + {added} native certs");
-        let config = rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
+        // rustls sends no ALPN extension at all when this list is empty, which is
+        // itself a fingerprint: every mainstream HTTP client offers ALPN. Advertise
+        // exactly `http/1.1` — it matches both what this module actually writes
+        // (raw HTTP/1.1 bytes) and the single protocol the official Claude Code
+        // client offers. Adding h2 here would be a lie the raw writer cannot honor.
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
     })
 }

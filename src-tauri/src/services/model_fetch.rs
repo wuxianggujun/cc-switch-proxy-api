@@ -4,11 +4,14 @@
 //! 主要面向第三方聚合站（硅基流动、OpenRouter 等），以及把 Anthropic
 //! 协议挂在兼容子路径上的官方供应商（DeepSeek、Kimi、智谱 GLM 等）。
 
+use crate::database::{validate_endpoint_url, UpstreamType};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, USER_AGENT};
 use reqwest::StatusCode;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+use url::Url;
 
 /// 获取到的模型信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +33,30 @@ struct ModelEntry {
     owned_by: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClaudeModelsResponse {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+    #[serde(default)]
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiModelsResponse {
+    #[serde(default)]
+    models: Vec<GeminiModelEntry>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiModelEntry {
+    name: String,
+}
+
 const FETCH_TIMEOUT_SECS: u64 = 15;
+const MAX_GATEWAY_MODEL_PAGES: usize = 20;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HEADER_NAME_BYTES: usize = 256;
 const MAX_HEADER_VALUE_BYTES: usize = 16 * 1024;
@@ -132,6 +158,243 @@ pub async fn fetch_models(
         "All candidates failed: {}",
         last_err.unwrap_or_else(|| "no candidates".to_string())
     ))
+}
+
+/// 按网关上游协议获取模型列表。认证值只进入请求头，不进入 URL、日志或错误。
+pub async fn fetch_gateway_models(
+    base_url: &str,
+    api_key: &str,
+    upstream_type: UpstreamType,
+) -> Result<Vec<FetchedModel>, String> {
+    let base_url = base_url.trim();
+    let api_key = api_key.trim();
+    validate_endpoint_url(base_url).map_err(|e| e.to_string())?;
+    if api_key.is_empty() {
+        return Err("密钥不能为空".to_string());
+    }
+
+    let headers = build_gateway_headers(api_key, upstream_type)?;
+    let mut models = Vec::new();
+
+    match upstream_type {
+        UpstreamType::Claude => {
+            let mut url = gateway_models_url(base_url, upstream_type)?;
+            let mut seen_page_tokens = BTreeSet::new();
+            for page in 0..MAX_GATEWAY_MODEL_PAGES {
+                let response: ClaudeModelsResponse = fetch_gateway_page(&url, &headers, api_key)
+                    .await
+                    .map_err(GatewayPageError::into_message)?;
+                models.extend(response.data.into_iter().map(|model| FetchedModel {
+                    id: model.id,
+                    owned_by: model.owned_by,
+                }));
+                if !response.has_more {
+                    break;
+                }
+                let last_id = response
+                    .last_id
+                    .ok_or_else(|| "Claude 模型分页响应缺少 last_id".to_string())?;
+                if !seen_page_tokens.insert(last_id.clone()) {
+                    return Err("Claude 模型分页游标重复".to_string());
+                }
+                if page + 1 == MAX_GATEWAY_MODEL_PAGES {
+                    return Err(format!("模型分页超过安全上限 {MAX_GATEWAY_MODEL_PAGES}"));
+                }
+                url.query_pairs_mut()
+                    .clear()
+                    .append_pair("after_id", &last_id);
+            }
+        }
+        UpstreamType::Gemini => {
+            let mut url = gateway_models_url(base_url, upstream_type)?;
+            let mut seen_page_tokens = BTreeSet::new();
+            for page in 0..MAX_GATEWAY_MODEL_PAGES {
+                let response: GeminiModelsResponse = fetch_gateway_page(&url, &headers, api_key)
+                    .await
+                    .map_err(GatewayPageError::into_message)?;
+                models.extend(response.models.into_iter().filter_map(|model| {
+                    let id = model.name.strip_prefix("models/").unwrap_or(&model.name);
+                    (!id.is_empty()).then(|| FetchedModel {
+                        id: id.to_string(),
+                        owned_by: Some("google".to_string()),
+                    })
+                }));
+                let Some(next_page_token) = response
+                    .next_page_token
+                    .filter(|token| !token.trim().is_empty())
+                else {
+                    break;
+                };
+                if !seen_page_tokens.insert(next_page_token.clone()) {
+                    return Err("Gemini 模型分页游标重复".to_string());
+                }
+                if page + 1 == MAX_GATEWAY_MODEL_PAGES {
+                    return Err(format!("模型分页超过安全上限 {MAX_GATEWAY_MODEL_PAGES}"));
+                }
+                url.query_pairs_mut()
+                    .clear()
+                    .append_pair("pageToken", &next_page_token);
+            }
+        }
+        UpstreamType::Openai | UpstreamType::Codex | UpstreamType::Deepseek => {
+            let candidates = gateway_openai_models_url_candidates(base_url)?;
+            let response: ModelsResponse =
+                fetch_gateway_candidate(&candidates, &headers, api_key).await?;
+            models.extend(response.data.unwrap_or_default().into_iter().map(|model| {
+                FetchedModel {
+                    id: model.id,
+                    owned_by: model.owned_by,
+                }
+            }));
+        }
+    }
+
+    // ID 是前端唯一选择值；排序与去重确保分页重叠不会产生重复项。
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
+    Ok(models)
+}
+
+fn build_gateway_headers(api_key: &str, upstream_type: UpstreamType) -> Result<HeaderMap, String> {
+    let value =
+        HeaderValue::from_str(api_key).map_err(|_| "密钥无法用于 HTTP 请求头".to_string())?;
+    let mut headers = HeaderMap::new();
+    match upstream_type {
+        UpstreamType::Claude => {
+            headers.insert(HeaderName::from_static("x-api-key"), value);
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        UpstreamType::Gemini => {
+            headers.insert(HeaderName::from_static("x-goog-api-key"), value);
+        }
+        UpstreamType::Openai | UpstreamType::Codex | UpstreamType::Deepseek => {
+            let bearer = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|_| "密钥无法用于 HTTP 请求头".to_string())?;
+            headers.insert(AUTHORIZATION, bearer);
+        }
+    }
+    Ok(headers)
+}
+
+fn gateway_models_url(base_url: &str, upstream_type: UpstreamType) -> Result<Url, String> {
+    let base_url = base_url.trim_end_matches('/');
+    let suffix = match upstream_type {
+        UpstreamType::Gemini if base_url.ends_with("/v1beta") => "/models",
+        UpstreamType::Gemini => "/v1beta/models",
+        UpstreamType::Claude
+        | UpstreamType::Openai
+        | UpstreamType::Codex
+        | UpstreamType::Deepseek
+            if ends_with_version_segment(base_url) =>
+        {
+            "/models"
+        }
+        UpstreamType::Claude
+        | UpstreamType::Openai
+        | UpstreamType::Codex
+        | UpstreamType::Deepseek => "/v1/models",
+    };
+    Url::parse(&format!("{base_url}{suffix}")).map_err(|_| "无法构造模型列表 URL".to_string())
+}
+
+fn gateway_openai_models_url_candidates(base_url: &str) -> Result<Vec<Url>, String> {
+    let base_url = base_url.trim_end_matches('/');
+    let mut values = if let Some(root) = base_url.strip_suffix("/v1") {
+        vec![format!("{base_url}/models"), format!("{root}/models")]
+    } else if ends_with_version_segment(base_url) {
+        vec![
+            format!("{base_url}/models"),
+            format!("{base_url}/v1/models"),
+        ]
+    } else {
+        vec![
+            format!("{base_url}/v1/models"),
+            format!("{base_url}/models"),
+        ]
+    };
+    values.dedup();
+    values
+        .into_iter()
+        .map(|value| Url::parse(&value).map_err(|_| "无法构造模型列表 URL".to_string()))
+        .collect()
+}
+
+async fn fetch_gateway_candidate<T: DeserializeOwned>(
+    candidates: &[Url],
+    headers: &HeaderMap,
+    api_key: &str,
+) -> Result<T, String> {
+    let mut last_err = None;
+    for url in candidates {
+        match fetch_gateway_page(url, headers, api_key).await {
+            Ok(response) => return Ok(response),
+            Err(GatewayPageError::NotFound(message)) => last_err = Some(message),
+            Err(GatewayPageError::Fatal(message)) => return Err(message),
+        }
+    }
+    Err(format!(
+        "All candidates failed: {}",
+        last_err.unwrap_or_else(|| "no candidates".to_string())
+    ))
+}
+
+enum GatewayPageError {
+    NotFound(String),
+    Fatal(String),
+}
+
+impl GatewayPageError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NotFound(message) | Self::Fatal(message) => message,
+        }
+    }
+}
+
+async fn fetch_gateway_page<T: DeserializeOwned>(
+    url: &Url,
+    headers: &HeaderMap,
+    api_key: &str,
+) -> Result<T, GatewayPageError> {
+    let known_secrets = [api_key.to_string()];
+    log::debug!(
+        "[GatewayModelFetch] Trying endpoint: {}",
+        crate::url_for_log_with_secrets(url.as_str(), &known_secrets)
+    );
+    let response = crate::proxy::http_client::get()
+        .get(url.clone())
+        .headers(headers.clone())
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|error| {
+            GatewayPageError::Fatal(crate::redact_known_secrets_strict(
+                &format!("模型请求失败: {error}"),
+                &known_secrets,
+            ))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = redact_model_fetch_error_body(
+            response.text().await.unwrap_or_default(),
+            &known_secrets,
+        );
+        let message = format!("HTTP {status}: {body}");
+        return if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
+            Err(GatewayPageError::NotFound(message))
+        } else {
+            Err(GatewayPageError::Fatal(message))
+        };
+    }
+    response.json::<T>().await.map_err(|error| {
+        GatewayPageError::Fatal(crate::redact_known_secrets_strict(
+            &format!("Failed to parse response: {error}"),
+            &known_secrets,
+        ))
+    })
 }
 
 fn redact_model_fetch_error_body(body: String, known_secrets: &[String]) -> String {
@@ -312,6 +575,174 @@ fn ends_with_version_segment(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_model_fetch_uses_protocol_specific_urls_and_auth() {
+        let claude =
+            gateway_models_url("https://claude.example.com/v1", UpstreamType::Claude).unwrap();
+        assert_eq!(claude.as_str(), "https://claude.example.com/v1/models");
+        let claude_headers = build_gateway_headers("claude-key", UpstreamType::Claude).unwrap();
+        assert_eq!(claude_headers["x-api-key"], "claude-key");
+        assert_eq!(claude_headers["anthropic-version"], "2023-06-01");
+        assert!(!claude_headers.contains_key(AUTHORIZATION));
+
+        let gemini = gateway_models_url(
+            "https://generativelanguage.googleapis.com/v1beta",
+            UpstreamType::Gemini,
+        )
+        .unwrap();
+        assert_eq!(
+            gemini.as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+        let gemini_headers = build_gateway_headers("gemini-key", UpstreamType::Gemini).unwrap();
+        assert_eq!(gemini_headers["x-goog-api-key"], "gemini-key");
+        assert!(!gemini_headers.contains_key(AUTHORIZATION));
+
+        for upstream in [
+            UpstreamType::Openai,
+            UpstreamType::Codex,
+            UpstreamType::Deepseek,
+        ] {
+            let urls =
+                gateway_openai_models_url_candidates("https://relay.example.com/api").unwrap();
+            assert_eq!(
+                urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+                vec![
+                    "https://relay.example.com/api/v1/models",
+                    "https://relay.example.com/api/models",
+                ]
+            );
+            let versioned =
+                gateway_openai_models_url_candidates("https://relay.example.com/api/v1").unwrap();
+            assert_eq!(
+                versioned.iter().map(Url::as_str).collect::<Vec<_>>(),
+                vec![
+                    "https://relay.example.com/api/v1/models",
+                    "https://relay.example.com/api/models",
+                ]
+            );
+            let nonstandard_version =
+                gateway_openai_models_url_candidates("https://relay.example.com/api/v4").unwrap();
+            assert_eq!(
+                nonstandard_version
+                    .iter()
+                    .map(Url::as_str)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "https://relay.example.com/api/v4/models",
+                    "https://relay.example.com/api/v4/v1/models",
+                ]
+            );
+            let headers = build_gateway_headers("bearer-key", upstream).unwrap();
+            assert_eq!(headers[AUTHORIZATION], "Bearer bearer-key");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn gateway_openai_model_fetch_falls_back_only_for_404_or_405() {
+        crate::proxy::http_client::init(None).unwrap();
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requested.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/models",
+                axum::routing::get({
+                    let seen = requested.clone();
+                    move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().unwrap().push("/api/v1/models");
+                            axum::http::StatusCode::NOT_FOUND
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/models",
+                axum::routing::get(move |headers: axum::http::HeaderMap| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push("/api/models");
+                        assert_eq!(headers[AUTHORIZATION], "Bearer loopback-secret");
+                        axum::Json(serde_json::json!({
+                            "data": [{"id": "fallback-model", "owned_by": "loopback"}]
+                        }))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let models = fetch_gateway_models(
+            &format!("http://{address}/api"),
+            "loopback-secret",
+            UpstreamType::Openai,
+        )
+        .await
+        .unwrap();
+        assert_eq!(models[0].id, "fallback-model");
+        assert_eq!(
+            *requested.lock().unwrap(),
+            vec!["/api/v1/models", "/api/models"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn gateway_model_fetch_parse_error_is_classified_and_redacted() {
+        crate::proxy::http_client::init(None).unwrap();
+        let fallback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/models",
+                axum::routing::get(|| async { "loopback-secret is not json" }),
+            )
+            .route(
+                "/api/models",
+                axum::routing::get(move || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async { axum::Json(serde_json::json!({"data": []})) }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let error = fetch_gateway_models(
+            &format!("http://{address}/api"),
+            "loopback-secret",
+            UpstreamType::Openai,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("Failed to parse"), "{error}");
+        assert!(!error.contains("loopback-secret"), "{error}");
+        assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn gateway_model_envelopes_parse_pagination_fields() {
+        let claude: ClaudeModelsResponse = serde_json::from_str(
+            r#"{"data":[{"id":"claude-model"}],"has_more":true,"last_id":"cursor-a"}"#,
+        )
+        .unwrap();
+        assert!(claude.has_more);
+        assert_eq!(claude.last_id.as_deref(), Some("cursor-a"));
+        assert_eq!(claude.data[0].id, "claude-model");
+
+        let gemini: GeminiModelsResponse = serde_json::from_str(
+            r#"{"models":[{"name":"models/gemini-model"}],"nextPageToken":"cursor-b"}"#,
+        )
+        .unwrap();
+        assert_eq!(gemini.next_page_token.as_deref(), Some("cursor-b"));
+        assert_eq!(gemini.models[0].name, "models/gemini-model");
+    }
 
     #[test]
     fn model_fetch_headers_follow_pi_api_format() {

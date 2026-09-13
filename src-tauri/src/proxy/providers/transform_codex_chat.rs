@@ -43,7 +43,7 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
 ];
 
 const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
-const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
+pub(crate) const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
@@ -1269,7 +1269,7 @@ fn serialize_tool_definition_for_description(tool: &Value) -> String {
 ///
 /// Some Responses tools carry `parameters: null` or `parameters: {"type": null}`,
 /// but OpenAI Chat Completions strictly requires `{"type": "object", "properties": {...}}`.
-fn normalize_function_parameters(params: Option<&Value>) -> Value {
+pub(crate) fn normalize_function_parameters(params: Option<&Value>) -> Value {
     let mut params = match params {
         Some(Value::Object(obj)) => Value::Object(obj.clone()),
         _ => json!({"type": "object", "properties": {}}),
@@ -1326,7 +1326,7 @@ fn responses_function_tool_to_chat_tool(tool: &Value, chat_name: &str) -> Option
     }))
 }
 
-fn responses_function_call_to_chat_tool_call(
+pub(crate) fn responses_function_call_to_chat_tool_call(
     item: &Value,
     tool_context: &CodexToolContext,
 ) -> Value {

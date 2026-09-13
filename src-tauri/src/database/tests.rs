@@ -561,6 +561,37 @@ fn schema_create_tables_repairs_legacy_proxy_config_singleton_to_per_app() {
         .expect("query by app_type");
 }
 
+/// 全新库走 create_tables + 全量 schema 迁移后，监听端口必须是本 fork
+/// 的默认值，而不是上游 15721。否则会与本机已安装的 CC Switch 抢端口。
+#[test]
+fn fresh_database_uses_fork_default_listen_port() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+    Database::create_tables_on_conn(&conn).expect("create tables");
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT listen_port FROM proxy_config")
+        .expect("prepare");
+    let ports: Vec<i32> = stmt
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("collect ports");
+    assert!(
+        !ports.is_empty(),
+        "fresh database must seed at least one proxy_config row"
+    );
+    for port in ports {
+        assert_eq!(
+            port,
+            crate::config::DEFAULT_LISTEN_PORT as i32,
+            "fresh database listen_port must not fall back to the upstream 15721 default"
+        );
+    }
+}
+
 #[test]
 fn migration_from_v3_8_schema_v1_to_current_schema_v3() {
     let conn = Connection::open_in_memory().expect("open memory db");

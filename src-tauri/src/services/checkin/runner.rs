@@ -3,7 +3,7 @@
 //! reqwest 未启用 `cookie` feature，所以登录态靠手动解析 `Set-Cookie`
 //! 再拼到签到请求的 `Cookie` 头上，而不是依赖 cookie store。
 
-use super::browser::CLEARANCE_USER_AGENT;
+use super::browser::{CF_CLEARANCE, CLEARANCE_USER_AGENT};
 use super::{
     CheckinAuthKind, CheckinBodyKind, CheckinLogin, CheckinRequest, CheckinResult, CheckinSite,
     CheckinStatus,
@@ -56,13 +56,39 @@ pub async fn run_checkin_with(
     site: &CheckinSite,
     clearance: Option<Clearance<'_>>,
 ) -> CheckinResult {
-    match execute(site, clearance).await {
+    run_with_credentials(site, clearance, None).await
+}
+
+/// Browser account cookies come from the entry's profile, never from the clearance cache.
+/// An empty clearance allows ordinary sites to work without waiting for a nonexistent CF challenge.
+pub(super) async fn run_browser_checkin(
+    site: &CheckinSite,
+    clearance: Option<Clearance<'_>>,
+    account_cookie: &str,
+) -> CheckinResult {
+    if site.auth_kind != CheckinAuthKind::Browser {
+        return run_checkin_with(site, None).await;
+    }
+    let clearance = clearance.unwrap_or(Clearance {
+        cookie: "",
+        user_agent: CLEARANCE_USER_AGENT,
+    });
+    run_with_credentials(site, Some(clearance), Some(account_cookie)).await
+}
+
+async fn run_with_credentials(
+    site: &CheckinSite,
+    clearance: Option<Clearance<'_>>,
+    account_cookie: Option<&str>,
+) -> CheckinResult {
+    match execute(site, clearance, account_cookie).await {
         Ok(result) => result,
         Err(message) => CheckinResult {
             status: CheckinStatus::Error,
             at: now(),
             http_status: None,
             message,
+            needs_login: false,
         },
     }
 }
@@ -70,6 +96,7 @@ pub async fn run_checkin_with(
 async fn execute(
     site: &CheckinSite,
     clearance: Option<Clearance<'_>>,
+    account_cookie: Option<&str>,
 ) -> Result<CheckinResult, String> {
     // Browser 认证下 UA 必须与过闸窗口一致，否则 cf_clearance 当场失效。
     let user_agent = clearance
@@ -93,7 +120,7 @@ async fn execute(
         CheckinAuthKind::Browser => Some(
             clearance
                 .as_ref()
-                .map(|c| c.cookie.to_string())
+                .map(|c| browser_request_cookies(c.cookie, account_cookie))
                 .ok_or_else(|| "缺少 Cloudflare 过闸凭证".to_string())?,
         ),
     };
@@ -106,6 +133,12 @@ async fn execute(
     )
     .await?;
     let http_status = response.status().as_u16();
+    let login_redirect = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|location| url::Url::parse(&site.request.url).ok()?.join(location).ok())
+        .is_some_and(|url| is_login_path(url.path()));
     let body = read_body(response).await?;
 
     // 先判是否被 CF 挡下：此时 body 是挑战页而非站点响应，按判定串比对
@@ -116,10 +149,14 @@ async fn execute(
             at: now(),
             http_status: Some(http_status),
             message: "被 Cloudflare 拦截，需要重新通过站点验证".to_string(),
+            needs_login: false,
         });
     }
 
-    let ok = judge(&site.request.success_contains, http_status, &body);
+    let needs_login = site.auth_kind == CheckinAuthKind::Browser
+        && (is_login_required(http_status, &body)
+            || ((300..400).contains(&http_status) && login_redirect));
+    let ok = !needs_login && judge(&site.request.success_contains, http_status, &body);
 
     Ok(CheckinResult {
         status: if ok {
@@ -130,6 +167,7 @@ async fn execute(
         at: now(),
         http_status: Some(http_status),
         message: extract_message(&body),
+        needs_login,
     })
 }
 
@@ -223,6 +261,11 @@ async fn send_checkin(
     let mut headers = HeaderMap::new();
     let mut cookies = indexmap::IndexMap::new();
 
+    // 自动凭证先合并，用户显式 Cookie 后合并，避免覆盖用户选择的账号。
+    if let Some(cookie) = session_cookie {
+        merge_cookies(&mut cookies, cookie);
+    }
+
     for header in &request.headers {
         let name = header.name.trim();
         if name.is_empty() {
@@ -239,9 +282,6 @@ async fn send_checkin(
         }
     }
 
-    if let Some(cookie) = session_cookie {
-        merge_cookies(&mut cookies, cookie);
-    }
     if !cookies.is_empty() {
         let cookie = cookies
             .iter()
@@ -286,6 +326,70 @@ fn merge_cookies(cookies: &mut indexmap::IndexMap<String, String>, header: &str)
             }
         }
     }
+}
+
+/// Legacy clearance caches are CF-only. Profile account cookies are a separate source;
+/// user headers are merged afterwards by send_checkin and therefore still take precedence.
+fn browser_request_cookies(clearance: &str, account_cookie: Option<&str>) -> String {
+    let mut cookies = indexmap::IndexMap::new();
+    merge_cookies(&mut cookies, clearance);
+    cookies.retain(|name, _| name == CF_CLEARANCE);
+    if let Some(account_cookie) = account_cookie {
+        let mut account = indexmap::IndexMap::new();
+        merge_cookies(&mut account, account_cookie);
+        account.retain(|name, _| super::profile::is_account_cookie(name));
+        cookies.extend(account);
+    }
+    cookies
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn is_login_path(path: &str) -> bool {
+    matches!(
+        path.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "login" | "signin" | "sign-in"
+    )
+}
+
+fn is_login_required(status: u16, body: &str) -> bool {
+    if status == 401 {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    if value.get("success").and_then(|value| value.as_bool()) == Some(true) {
+        return false;
+    }
+    let message = extract_message(body).to_ascii_lowercase();
+    [
+        "unauthorized",
+        "unauthenticated",
+        "not logged in",
+        "please log in",
+        "login required",
+        "session expired",
+        "未登录",
+        "未登入",
+        "请先登录",
+        "請先登入",
+        "登录已过期",
+        "登录状态已失效",
+        "登录状态无效",
+        "登录失效",
+        "登入已過期",
+        "登录态已过期",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 async fn read_body(mut response: Response) -> Result<String, String> {
@@ -348,6 +452,264 @@ fn truncate_message(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct CheckinTestServer {
+        url: String,
+        received_headers: Arc<Mutex<Option<HeaderMap>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl CheckinTestServer {
+        async fn start() -> Self {
+            Self::with_response(200, r#"{"success":true}"#).await
+        }
+
+        async fn with_response(status: u16, body: &'static str) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let received_headers = Arc::new(Mutex::new(None));
+            let captured = Arc::clone(&received_headers);
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        *captured.lock().unwrap() = Some(headers);
+                        (axum::http::StatusCode::from_u16(status).unwrap(), body)
+                    }
+                }),
+            );
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                url,
+                received_headers,
+                task,
+            }
+        }
+
+        fn headers(&self) -> HeaderMap {
+            self.received_headers.lock().unwrap().clone().unwrap()
+        }
+    }
+
+    impl Drop for CheckinTestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_b_expired_login_is_failed_and_requests_reauthentication() {
+        for (http_status, body) in [
+            (401, r#"{"message":"Unauthorized"}"#),
+            (200, r#"{"success":false,"message":"请先登录"}"#),
+        ] {
+            let server = CheckinTestServer::with_response(http_status, body).await;
+            let site: CheckinSite = serde_json::from_value(serde_json::json!({
+                "id": "account-b", "name": "Account B", "authKind": "browser",
+                "request": {"url": server.url, "method": "GET"}
+            }))
+            .unwrap();
+            let result = run_checkin_with(
+                &site,
+                Some(Clearance {
+                    cookie: "cf_clearance=passed",
+                    user_agent: CLEARANCE_USER_AGENT,
+                }),
+            )
+            .await;
+            assert_eq!(result.status, CheckinStatus::Failed);
+            assert_eq!(serde_json::to_value(result).unwrap()["needsLogin"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_b_account_cookie_works_without_a_cloudflare_cookie() {
+        let server = CheckinTestServer::start().await;
+        let site: CheckinSite = serde_json::from_value(serde_json::json!({
+            "id": "account-b", "name": "Account B", "authKind": "browser",
+            "request": {"url": server.url, "method": "GET"}
+        }))
+        .unwrap();
+        let result = run_browser_checkin(&site, None, "session=account-b").await;
+        assert_eq!(result.status, CheckinStatus::Success);
+        assert_eq!(server.headers()[COOKIE], "session=account-b");
+        assert_eq!(server.headers()[USER_AGENT], CLEARANCE_USER_AGENT);
+    }
+
+    #[tokio::test]
+    async fn profile_b_explicit_cookie_wins_over_profile_and_clearance_cache() {
+        let server = CheckinTestServer::start().await;
+        let site: CheckinSite = serde_json::from_value(serde_json::json!({
+            "id": "account-b", "name": "Account B", "authKind": "browser",
+            "request": {"url": server.url, "method": "GET", "headers": [
+                {"name": "Cookie", "value": "session=manual-account; token=manual-token"}
+            ]}
+        }))
+        .unwrap();
+        let result = run_browser_checkin(
+            &site,
+            Some(Clearance {
+                cookie: "cf_clearance=passed; session=legacy-account",
+                user_agent: CLEARANCE_USER_AGENT,
+            }),
+            "session=profile-account; token=profile-token; cf_clearance=must-not-override",
+        )
+        .await;
+        assert_eq!(result.status, CheckinStatus::Success);
+        let headers = server.headers();
+        assert_eq!(headers.get_all(COOKIE).iter().count(), 1);
+        let mut cookies = indexmap::IndexMap::new();
+        merge_cookies(&mut cookies, headers[COOKIE].to_str().unwrap());
+        assert_eq!(cookies.len(), 3);
+        assert_eq!(cookies["session"], "manual-account");
+        assert_eq!(cookies["token"], "manual-token");
+        assert_eq!(cookies["cf_clearance"], "passed");
+    }
+
+    #[tokio::test]
+    async fn profile_b_authentication_hints_preserve_cf_and_business_statuses() {
+        for (status, body, expected) in [
+            (
+                403,
+                r#"{"message":"Permission denied"}"#,
+                CheckinStatus::Failed,
+            ),
+            (403, "<title>Just a moment</title>", CheckinStatus::Blocked),
+            (
+                200,
+                r#"{"success":false,"message":"今日已签到"}"#,
+                CheckinStatus::Failed,
+            ),
+            (
+                200,
+                r#"{"success":true,"message":"未登录用户的说明"}"#,
+                CheckinStatus::Success,
+            ),
+        ] {
+            let server = CheckinTestServer::with_response(status, body).await;
+            let site: CheckinSite = serde_json::from_value(serde_json::json!({
+                "id": "account-b", "name": "Account B", "authKind": "browser",
+                "request": {"url": server.url, "method": "GET"}
+            }))
+            .unwrap();
+            let result = run_browser_checkin(&site, None, "session=account-b").await;
+            assert_eq!(result.status, expected);
+            assert!(!result.needs_login);
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_cookie_does_not_override_explicit_account_cookie() {
+        let server = CheckinTestServer::start().await;
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let request: CheckinRequest = serde_json::from_value(serde_json::json!({
+            "url": server.url,
+            "method": "GET",
+            "headers": [
+                {"name": "cOoKiE", "value": "session=account-b; token=manual=="},
+                {"name": "User-Agent", "value": "must-not-replace-clearance-ua"}
+            ]
+        }))
+        .unwrap();
+
+        send_checkin(
+            &client,
+            &request,
+            Some("cf_clearance=passed; session=account-a"),
+            Some(CLEARANCE_USER_AGENT),
+        )
+        .await
+        .unwrap();
+
+        let headers = server.headers();
+        assert_eq!(headers.get_all(COOKIE).iter().count(), 1);
+        let cookie_header = headers[COOKIE].to_str().unwrap();
+        let mut cookies = indexmap::IndexMap::new();
+        merge_cookies(&mut cookies, cookie_header);
+        assert_eq!(cookies["session"], "account-b");
+        assert_eq!(cookies["cf_clearance"], "passed");
+        assert_eq!(cookies["token"], "manual==");
+        assert_eq!(cookie_header.split(';').count(), 3);
+        assert_eq!(headers[USER_AGENT], CLEARANCE_USER_AGENT);
+    }
+
+    #[tokio::test]
+    async fn browser_explicit_clearance_cookie_overrides_cached_clearance() {
+        let server = CheckinTestServer::start().await;
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let request: CheckinRequest = serde_json::from_value(serde_json::json!({
+            "url": server.url,
+            "method": "GET",
+            "headers": [{"name": "Cookie", "value": "cf_clearance=explicit"}]
+        }))
+        .unwrap();
+
+        send_checkin(
+            &client,
+            &request,
+            Some("cf_clearance=cached"),
+            Some(CLEARANCE_USER_AGENT),
+        )
+        .await
+        .unwrap();
+
+        let headers = server.headers();
+        assert_eq!(headers.get_all(COOKIE).iter().count(), 1);
+        assert_eq!(headers[COOKIE], "cf_clearance=explicit");
+        assert_eq!(headers[USER_AGENT], CLEARANCE_USER_AGENT);
+    }
+
+    #[tokio::test]
+    async fn browser_cached_cookies_never_supply_account_login_state() {
+        let server = CheckinTestServer::start().await;
+        // Both entries share a site and the same legacy WebView cookie snapshot.
+        // Omitting an explicit account must not fall back to the WebView's account.
+        for account in [Some("account-a"), Some("account-b"), None] {
+            let explicit_headers = account
+                .map(|account| {
+                    serde_json::json!([{"name": "Cookie", "value": format!("session={account}")}])
+                })
+                .unwrap_or_else(|| serde_json::json!([]));
+            let site: CheckinSite = serde_json::from_value(serde_json::json!({
+                "id": account.unwrap_or("no-account"),
+                "name": "same-site",
+                "authKind": "browser",
+                "request": {"url": server.url, "method": "GET", "headers": explicit_headers}
+            }))
+            .unwrap();
+
+            let result = run_checkin_with(
+                &site,
+                Some(Clearance {
+                    cookie: "cf_clearance=passed; session=account-a; auth_token=account-a-token",
+                    user_agent: CLEARANCE_USER_AGENT,
+                }),
+            )
+            .await;
+
+            assert_eq!(result.status, CheckinStatus::Success);
+            let headers = server.headers();
+            assert_eq!(headers.get_all(COOKIE).iter().count(), 1);
+            let mut cookies = indexmap::IndexMap::new();
+            merge_cookies(&mut cookies, headers[COOKIE].to_str().unwrap());
+            assert_eq!(cookies["cf_clearance"], "passed");
+            assert_eq!(cookies.get("session").map(String::as_str), account);
+            assert_eq!(cookies.len(), if account.is_some() { 2 } else { 1 });
+            assert_eq!(headers[USER_AGENT], CLEARANCE_USER_AGENT);
+        }
+    }
 
     #[test]
     fn readiness_http_error_cannot_match_success_keyword() {

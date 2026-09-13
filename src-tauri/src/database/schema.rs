@@ -123,10 +123,10 @@ impl Database {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // 8. Proxy Config 表（三行结构，app_type 主键）
-        conn.execute("CREATE TABLE IF NOT EXISTS proxy_config (
+        conn.execute(&format!("CREATE TABLE IF NOT EXISTS proxy_config (
             app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini','grokbuild')),
             proxy_enabled INTEGER NOT NULL DEFAULT 0, listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
-            listen_port INTEGER NOT NULL DEFAULT 15721, enable_logging INTEGER NOT NULL DEFAULT 1,
+            listen_port INTEGER NOT NULL DEFAULT {default_port}, enable_logging INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 0, auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
             max_retries INTEGER NOT NULL DEFAULT 3, streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
             streaming_idle_timeout INTEGER NOT NULL DEFAULT 120, non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
@@ -136,7 +136,7 @@ impl Database {
             default_cost_multiplier TEXT NOT NULL DEFAULT '1',
             pricing_model_source TEXT NOT NULL DEFAULT 'response',
             created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )", []).map_err(|e| AppError::Database(e.to_string()))?;
+        )", default_port = crate::config::DEFAULT_LISTEN_PORT), []).map_err(|e| AppError::Database(e.to_string()))?;
 
         // 初始化三行数据（每应用不同默认值）
         //
@@ -424,6 +424,7 @@ impl Database {
 
         // API 网关表（接入点 / 密钥 / 入站客户端凭据）
         Self::create_api_gateway_tables(conn)?;
+        Self::create_request_trace_tables(conn)?;
 
         // 删除旧的 failover_queue 表（如果存在）
         let _ = conn.execute("DROP INDEX IF EXISTS idx_failover_queue_order", []);
@@ -607,6 +608,28 @@ impl Database {
         )
         .map_err(|e| AppError::Database(format!("创建 api_endpoints 选线索引失败: {e}")))?;
 
+        conn.execute(
+            "UPDATE api_keys
+             SET key_last4 = substr('****', 1, length(key_last4))
+             WHERE length(key_last4) BETWEEN 1 AND 3",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("修复短 API 密钥展示值失败: {e}")))?;
+
+        // 幂等修复历史半成品：启用接入点必须至少关联一把启用密钥。
+        conn.execute(
+            "UPDATE api_endpoints
+             SET enabled = 0
+             WHERE enabled = 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM api_keys
+                   WHERE api_keys.endpoint_id = api_endpoints.id
+                     AND api_keys.enabled = 1
+               )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("修复无可用密钥的 API 接入点失败: {e}")))?;
+
         Ok(())
     }
 
@@ -735,6 +758,10 @@ impl Database {
                         log::info!("迁移数据库从 v19 到 v20（API 网关接入点/密钥/客户端凭据表）");
                         Self::migrate_v19_to_v20(conn)?;
                         Self::set_user_version(conn, 20)?;
+                    }
+                    20 => {
+                        Self::create_request_trace_tables(conn)?;
+                        Self::set_user_version(conn, 21)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1628,11 +1655,11 @@ impl Database {
         conn.execute("DROP TABLE IF EXISTS proxy_config_v14", [])
             .map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute(
-            "CREATE TABLE proxy_config_v14 (
+            &format!("CREATE TABLE proxy_config_v14 (
                 app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini','grokbuild')),
                 proxy_enabled INTEGER NOT NULL DEFAULT 0,
                 listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
-                listen_port INTEGER NOT NULL DEFAULT 15721,
+                listen_port INTEGER NOT NULL DEFAULT {default_port},
                 enable_logging INTEGER NOT NULL DEFAULT 1,
                 enabled INTEGER NOT NULL DEFAULT 0,
                 auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
@@ -1650,16 +1677,17 @@ impl Database {
                 live_takeover_active INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
+            )", default_port = crate::config::DEFAULT_LISTEN_PORT),
             [],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        let default_port_literal = crate::config::DEFAULT_LISTEN_PORT.to_string();
         let copied_columns = [
             ("app_type", "'claude'"),
             ("proxy_enabled", "0"),
             ("listen_address", "'127.0.0.1'"),
-            ("listen_port", "15721"),
+            ("listen_port", default_port_literal.as_str()),
             ("enable_logging", "1"),
             ("enabled", "0"),
             ("auto_failover_enabled", "0"),

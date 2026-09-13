@@ -13,7 +13,7 @@ use super::{
     forwarder::ActiveConnectionGuard,
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
-        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
+        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
     providers::{
@@ -85,7 +85,7 @@ pub async fn get_status(State(state): State<ProxyState>) -> Result<Json<ProxySta
 /// Only serves the catalog when the live config.toml still references the
 /// cc-switch–owned `model_catalog_json`, using the same path ownership rules as
 /// Codex live-setting import.
-pub async fn handle_models() -> Result<Json<Value>, ProxyError> {
+pub async fn handle_models(State(state): State<ProxyState>) -> Result<Json<Value>, ProxyError> {
     let config_dir = crate::codex_config::get_codex_config_dir();
     let active_catalog_path = match crate::codex_config::read_codex_config_text() {
         Ok(config_text) => {
@@ -94,7 +94,7 @@ pub async fn handle_models() -> Result<Json<Value>, ProxyError> {
         Err(_) => None,
     };
 
-    let catalog = if let Some(catalog_path) =
+    let mut catalog = if let Some(catalog_path) =
         active_catalog_path.as_ref().filter(|path| path.exists())
     {
         match crate::codex_config::read_codex_model_catalog_text(catalog_path) {
@@ -112,6 +112,43 @@ pub async fn handle_models() -> Result<Json<Value>, ProxyError> {
         }
         json!({"models": []})
     };
+    // Keep Codex's managed catalog while also serving the standard OpenAI list
+    // envelope to generic SDKs. Wildcard route rules are not concrete models.
+    let endpoints = state
+        .db
+        .list_api_endpoints()
+        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+    let mut models = std::collections::BTreeSet::new();
+    for endpoint in endpoints.iter().filter(|endpoint| {
+        endpoint.enabled && endpoint.upstream_type != crate::database::UpstreamType::Gemini
+    }) {
+        for model in &endpoint.models {
+            if !model.contains('*') && !model.contains('?') {
+                models.insert(model.clone());
+            }
+        }
+    }
+    if let Some(entries) = catalog.get("models").and_then(Value::as_array) {
+        for entry in entries {
+            if let Some(model) = entry
+                .get("slug")
+                .or_else(|| entry.get("id"))
+                .and_then(Value::as_str)
+            {
+                models.insert(model.into());
+            }
+        }
+    }
+    if !catalog.is_object() {
+        catalog = json!({"models":[]});
+    }
+    catalog["object"] = json!("list");
+    catalog["data"] = Value::Array(
+        models
+            .into_iter()
+            .map(|id| json!({"id":id,"object":"model","created":0,"owned_by":"cc-switch"}))
+            .collect(),
+    );
     Ok(Json(catalog))
 }
 
@@ -128,7 +165,19 @@ pub async fn handle_messages(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
-    handle_messages_for_app(state, request, AppType::Claude, "Claude", "claude", None).await
+    match handle_messages_for_app(
+        state,
+        request,
+        AppType::Claude,
+        "Claude",
+        "claude",
+        Some("/claude"),
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) => Ok(error.into_anthropic_response()),
+    }
 }
 
 pub async fn handle_claude_desktop_messages(
@@ -174,15 +223,16 @@ async fn handle_messages_for_app(
     let (parts, body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
+    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+        .map_err(|e| ProxyError::InvalidRequest(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
@@ -775,11 +825,17 @@ pub async fn handle_chat_completions(
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+        .map_err(|e| ProxyError::InvalidRequest(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
     let endpoint = endpoint_with_query(&uri, "/chat/completions");
+
+    let include_usage = body
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tool_context = super::providers::transform_chat_entry::chat_tool_context(&body);
 
     let is_stream = body
         .get("stream")
@@ -814,11 +870,13 @@ pub async fn handle_chat_completions(
     ctx.provider = result.provider;
     let response = result.response;
 
-    process_response(
+    super::chat_bridge::handle_chat_upstream_response(
         response,
         &ctx,
         &state,
-        &OPENAI_PARSER_CONFIG,
+        is_stream,
+        include_usage,
+        tool_context,
         connection_guard,
     )
     .await
@@ -865,7 +923,7 @@ async fn handle_responses_for_app(
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+        .map_err(|e| ProxyError::InvalidRequest(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
@@ -1063,7 +1121,7 @@ async fn handle_responses_compact_for_app(
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+        .map_err(|e| ProxyError::InvalidRequest(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
@@ -2066,7 +2124,7 @@ pub async fn handle_gemini(
         Value::Null
     } else {
         serde_json::from_slice(&body_bytes)
-            .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?
+            .map_err(|e| ProxyError::InvalidRequest(format!("Failed to parse request body: {e}")))?
     };
 
     // Resolve the URI model BEFORE gateway selection. Adding it afterwards let

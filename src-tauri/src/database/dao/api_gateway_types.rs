@@ -89,6 +89,9 @@ pub struct ApiEndpointRecord {
     /// 该接入点下的密钥数（列表页展示用，非表字段）。
     #[serde(default)]
     pub key_count: i64,
+    /// 该接入点下已启用的密钥数（用于判断是否可以启用接入点）。
+    #[serde(default)]
+    pub enabled_key_count: i64,
 }
 
 /// 新建接入点入参。
@@ -112,6 +115,74 @@ fn default_priority() -> i64 {
 
 fn default_internal_priority() -> i64 {
     50
+}
+
+/// 不含 endpoint_id 的密钥值，供原子创建与换绑复用。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewApiKeyValue {
+    pub api_key: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_internal_priority")]
+    pub internal_priority: i64,
+}
+
+/// 原子创建接入点及首把密钥的入参。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewApiEndpointWithKey {
+    pub endpoint: NewApiEndpoint,
+    pub first_key: NewApiKeyValue,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedApiEndpoint {
+    pub endpoint_id: String,
+    pub key_id: String,
+}
+
+/// 接入点编辑入参。是否换绑由后端对比旧目标决定。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateApiEndpointInput {
+    pub endpoint_id: String,
+    pub name: String,
+    pub upstream_type: UpstreamType,
+    pub base_url: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default = "default_priority")]
+    pub priority: i64,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub new_key: Option<NewApiKeyValue>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatedApiEndpoint {
+    pub endpoint_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    pub rebound: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyMutationOutcome {
+    pub endpoint_id: String,
+    pub endpoint_auto_disabled: bool,
+}
+
+/// 已保存接入点取模型时使用的进程内快照；明文密钥永不序列化或 Debug 输出。
+#[derive(Clone)]
+pub struct ApiEndpointModelFetchConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub upstream_type: UpstreamType,
 }
 
 /// 密钥记录。明文 api_key 不下发前端，只给末四位。
@@ -174,10 +245,11 @@ pub struct RouteCandidate {
     pub api_key: String,
 }
 
-/// 取末四位。不足四位则全量返回（调用方已校验非空）。
+/// 取末四位用于展示；短密钥不返回任何原文，避免完整密钥下发前端。
 pub fn last4(key: &str) -> String {
-    let trimmed = key.trim();
-    let chars: Vec<char> = trimmed.chars().collect();
-    let start = chars.len().saturating_sub(4);
-    chars[start..].iter().collect()
+    let chars: Vec<char> = key.trim().chars().collect();
+    if chars.len() <= 4 {
+        return "*".repeat(chars.len());
+    }
+    chars[chars.len() - 4..].iter().collect()
 }

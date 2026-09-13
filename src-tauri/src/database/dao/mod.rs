@@ -13,6 +13,7 @@ pub mod providers;
 pub mod providers_seed;
 pub mod proxy;
 pub mod proxy_pool;
+pub mod request_traces;
 pub mod settings;
 pub mod skills;
 pub mod stream_check;

@@ -2,7 +2,8 @@
 //!
 //! CF 的 JS 挑战校验浏览器运行时与 TLS 指纹，伪装请求头无法通过；而非交互式
 //! 挑战在真实浏览器里会自行算完并跳转。所以这里开一个真实 WebviewWindow
-//! 加载站点，等 cookie 出现再取走。
+//! 加载站点，等 cookie 出现后只取 `cf_clearance`；独立 profile 的账号 Cookie
+//! 由 profile 模块单独读取，用户显式请求头仍有最高优先级。
 //!
 //! 两个硬约束，都来自 CF 的 cookie 绑定策略：
 //!
@@ -16,7 +17,8 @@
 
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use super::{parse_browser_url, profile, CheckinSite};
+use tauri::{AppHandle, Manager};
 use tokio::time::sleep;
 
 /// CF 放行 cookie 名。
@@ -39,7 +41,7 @@ const INTERACTIVE_BUDGET: Duration = Duration::from_secs(180);
 /// 过闸产物。
 #[derive(Debug, Clone)]
 pub struct ClearanceOutcome {
-    /// 可直接用于 `Cookie` 头的串（含 cf_clearance 及同域其它 cookie）。
+    /// 可直接用于 `Cookie` 头的串（仅含 cf_clearance，不包含账号登录态）。
     pub cookie: String,
     /// 与 cookie 配对的 UA，必须原样交给 reqwest。
     pub user_agent: String,
@@ -51,6 +53,7 @@ struct ClearanceWindow(tauri::WebviewWindow);
 
 impl Drop for ClearanceWindow {
     fn drop(&mut self) {
+        profile::close_child_windows(self.0.app_handle(), self.0.label());
         if let Err(error) = self.0.destroy() {
             log::debug!("[Checkin] 关闭验证窗口: {error}");
         }
@@ -61,36 +64,42 @@ impl Drop for ClearanceWindow {
 ///
 /// 先隐藏窗口尝试自动过（非交互式挑战）；超时仍未拿到 cookie，则显示窗口
 /// 让用户完成 Turnstile 再继续等。两段都超时才返回错误。
-pub async fn acquire_clearance(app: &AppHandle, url: &str) -> Result<ClearanceOutcome, String> {
-    let target = url.trim();
-    if !(target.starts_with("http://") || target.starts_with("https://")) {
-        return Err(format!(
-            "过闸 URL 必须以 http:// 或 https:// 开头: {target}"
-        ));
+pub async fn acquire_clearance(
+    app: &AppHandle,
+    site: &CheckinSite,
+    force_refresh: bool,
+) -> Result<ClearanceOutcome, String> {
+    let challenge_url = parse_browser_url(site.resolve_challenge_url())?;
+    let request_url = parse_browser_url(&site.request.url)?;
+    let browser_profile = profile::BrowserProfile::for_site(site)?;
+    // Keep the entry's context alive while temporary verification windows come and go.
+    let session_window = profile::session_window(app, &browser_profile)?;
+    if force_refresh {
+        // Removing only the DB cache is insufficient: polling would immediately pick
+        // up the same rejected WebView cookie again. Never delete the account cookies.
+        for url in [&request_url, &challenge_url] {
+            for cookie in profile::cookies_for_url_when_ready(&session_window, url.clone())
+                .await?
+                .into_iter()
+                .filter(|cookie| cookie.name() == CF_CLEARANCE)
+            {
+                session_window
+                    .delete_cookie(cookie)
+                    .map_err(|error| format!("清除失效过闸 Cookie 失败: {error}"))?;
+            }
+        }
     }
-    let parsed: tauri::Url = target
-        .parse()
-        .map_err(|e| format!("过闸 URL 解析失败: {e}"))?;
-
-    let label = format!("cf-clearance-{}", uuid::Uuid::new_v4().simple());
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.destroy();
-    }
-
-    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(parsed.clone()))
-        .title("正在通过站点验证…")
-        .inner_size(480.0, 640.0)
-        .visible(false)
-        .focused(false)
-        .skip_taskbar(true)
-        // 与 reqwest 侧共用同一 UA，cookie 才不会因 UA 不匹配失效。
-        .user_agent(CLEARANCE_USER_AGENT)
-        .build()
-        .map_err(|e| format!("创建验证窗口失败: {e}"))?;
+    let label = format!(
+        "{}-clearance-{}",
+        browser_profile.window_prefix,
+        uuid::Uuid::new_v4().simple()
+    );
+    let window = profile::create_window(app, &browser_profile, &label, challenge_url, false, None)?;
 
     // RAII also destroys a hidden window if shutdown cancels the awaiting task.
     let window = ClearanceWindow(window);
-    run_challenge(&window.0, &parsed).await
+    // Cookie scope must match the actual API request, not just the verification page.
+    run_challenge(&window.0, &request_url).await
 }
 
 async fn run_challenge(
@@ -134,11 +143,12 @@ async fn poll_for_clearance(
 
     loop {
         // cookies_for_url 会带上 HttpOnly，cf_clearance 正是 HttpOnly。
-        let cookies = window
-            .cookies_for_url(parsed.clone())
-            .map_err(|e| format!("读取 WebView Cookie 失败: {e}"))?;
+        let cookies = profile::cookies_for_url_when_ready(window, parsed.clone()).await?;
 
-        if cookies.iter().any(|c| c.name() == CF_CLEARANCE) {
+        if cookies
+            .iter()
+            .any(|c| c.name() == CF_CLEARANCE && !c.value().is_empty())
+        {
             return Ok(Some(join_cookies(&cookies)));
         }
 
@@ -149,11 +159,37 @@ async fn poll_for_clearance(
     }
 }
 
-/// 折成 `a=1; b=2`。
+/// 只导出过闸凭证，不能把共享 WebView 中其它账号的登录态带入签到请求。
 fn join_cookies(cookies: &[tauri::webview::Cookie<'static>]) -> String {
     cookies
         .iter()
+        .filter(|c| c.name() == CF_CLEARANCE)
         .map(|c| format!("{}={}", c.name(), c.value()))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri::webview::Cookie;
+
+    #[test]
+    fn browser_cookie_export_only_contains_cf_clearance() {
+        let cookies = vec![
+            Cookie::new("session", "account-a"),
+            Cookie::new(CF_CLEARANCE, "passed=="),
+            Cookie::new("auth_token", "account-a-token"),
+            Cookie::new("__cf_bm", "bot-management"),
+            Cookie::new("CF_CLEARANCE", "not-the-clearance-cookie"),
+        ];
+
+        assert_eq!(join_cookies(&cookies), "cf_clearance=passed==");
+    }
+
+    #[test]
+    fn browser_cookie_export_without_clearance_is_empty() {
+        assert_eq!(join_cookies(&[]), "");
+        assert_eq!(join_cookies(&[Cookie::new("session", "account-a")]), "");
+    }
 }

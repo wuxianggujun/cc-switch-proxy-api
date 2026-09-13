@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import {
   CalendarCheck,
   ExternalLink,
+  LogIn,
   Pencil,
   Play,
   Plus,
@@ -31,6 +32,7 @@ import { CheckinSiteFormModal } from "./CheckinSiteFormModal";
 import {
   useCheckinConfig,
   useDeleteCheckinSite,
+  useOpenCheckinLogin,
   useRunAllCheckinSites,
   useRunCheckinSite,
   useSetCheckinSchedule,
@@ -57,6 +59,7 @@ export function CheckinPanel() {
   const setSchedule = useSetCheckinSchedule();
   const runSite = useRunCheckinSite();
   const runAll = useRunAllCheckinSites();
+  const openLogin = useOpenCheckinLogin();
 
   const sites = useMemo(
     () => [...(config?.sites ?? [])].sort((a, b) => a.sortIndex - b.sortIndex),
@@ -173,7 +176,7 @@ export function CheckinPanel() {
                 <TableHead>{t("checkin.table.status")}</TableHead>
                 <TableHead>{t("checkin.table.lastRun")}</TableHead>
                 <TableHead>{t("checkin.table.message")}</TableHead>
-                <TableHead className="w-32 text-right">
+                <TableHead className="w-40 text-right">
                   {t("checkin.table.actions")}
                 </TableHead>
               </TableRow>
@@ -219,6 +222,27 @@ export function CheckinPanel() {
                   </TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1">
+                      {site.authKind === "browser" && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => openLogin.mutate(site.id)}
+                          disabled={
+                            openLogin.isPending ||
+                            runSite.isPending ||
+                            runAll.isPending
+                          }
+                          aria-label={`${t("checkin.form.openLogin")} - ${site.name}`}
+                          title={t("checkin.form.openLogin")}
+                          className={
+                            site.lastResult?.needsLogin
+                              ? "text-amber-600 dark:text-amber-400"
+                              : undefined
+                          }
+                        >
+                          <LogIn className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="icon"

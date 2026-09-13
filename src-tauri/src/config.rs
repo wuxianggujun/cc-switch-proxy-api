@@ -6,6 +6,18 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
 
+/// 应用私有数据目录名（位于用户主目录下）。
+///
+/// 这是本 fork 与上游 `cc-switch` 的隔离边界之一：上游使用 `.cc-switch`，
+/// 本程序使用 `.cc-switch-proxy`，因此两者可在同一台机器上共存而不共享
+/// 数据库、settings.json、skills 与备份。
+pub const APP_DIR_NAME: &str = ".cc-switch-proxy";
+
+/// 本地路由服务默认监听端口。
+///
+/// 与上游默认的 15721 错开，避免两个程序同时运行时抢占同一端口。
+pub const DEFAULT_LISTEN_PORT: u16 = 15722;
+
 /// 获取用户主目录，带回退和日志
 ///
 /// ## Windows 注意事项
@@ -13,7 +25,8 @@ use crate::error::AppError;
 /// - `dirs::home_dir()` 在 Windows 上使用 `SHGetKnownFolderPath(FOLDERID_Profile)`，
 ///   返回的是真实用户目录（类似 `C:\\Users\\Alice`），与 v3.10.2 行为一致。
 /// - 不要直接使用 `HOME` 环境变量：它可能由 Git/Cygwin/MSYS 等第三方工具注入，
-///   且不一定等于用户目录，可能导致 `.cc-switch/cc-switch.db` 路径变化，从而“看起来像数据丢失”。
+///   且不一定等于用户目录，可能导致 `.cc-switch-proxy/cc-switch.db` 路径变化，
+///   从而“看起来像数据丢失”。
 ///
 /// ## 测试隔离
 ///
@@ -199,48 +212,22 @@ pub fn get_claude_settings_path() -> PathBuf {
     settings
 }
 
-/// 获取应用配置目录路径 (~/.cc-switch)
+/// 获取应用配置目录路径 (~/.cc-switch-proxy)
+///
+/// 不含任何指向上游 `~/.cc-switch` 的回退：那是另一个程序的数据目录，
+/// 读取它会让本 fork 与上游共享数据库并互相覆盖。
 pub fn get_app_config_dir() -> PathBuf {
     // An explicit test home is an isolation boundary, not a fallback preference.
-    // In-memory DB tests do not create cc-switch.db under the test home; without
-    // this early return the Windows HOME compatibility branch uses live data.
     if let Ok(home) = std::env::var("CC_SWITCH_TEST_HOME") {
         if !home.trim().is_empty() {
-            return PathBuf::from(home.trim()).join(".cc-switch");
+            return PathBuf::from(home.trim()).join(APP_DIR_NAME);
         }
     }
     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
         return custom;
     }
 
-    let default_dir = get_home_dir().join(".cc-switch");
-
-    // 兼容 v3.10.3：当用户环境存在 `HOME` 且与真实用户目录不同，
-    // v3.10.3 可能在 `HOME/.cc-switch/` 下创建/使用了数据库。
-    // 这里仅在“默认位置没有数据库”时回退到旧位置，避免再次出现“供应商消失”问题，
-    // 同时也避免新安装因为 `HOME` 被设置而写入非预期路径。
-    #[cfg(windows)]
-    {
-        let default_db = default_dir.join("cc-switch.db");
-        if !default_db.exists() {
-            if let Ok(home_env) = std::env::var("HOME") {
-                let trimmed = home_env.trim();
-                if !trimmed.is_empty() {
-                    let legacy_dir = PathBuf::from(trimmed).join(".cc-switch");
-                    if legacy_dir.join("cc-switch.db").exists() {
-                        log::info!(
-                            "Detected v3.10.3 legacy database at {}, using it instead of {}",
-                            legacy_dir.display(),
-                            default_dir.display()
-                        );
-                        return legacy_dir;
-                    }
-                }
-            }
-        }
-    }
-
-    default_dir
+    get_home_dir().join(APP_DIR_NAME)
 }
 
 /// 获取应用配置文件路径
@@ -510,18 +497,19 @@ fn atomic_write_with_unix_mode(
 mod tests {
     use super::*;
 
+    struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn explicit_test_home_never_uses_a_legacy_home_database() {
-        struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(value) => std::env::set_var(self.0, value),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
         let _home = RestoreEnv("HOME", std::env::var_os("HOME"));
         let _test_home = RestoreEnv(
             "CC_SWITCH_TEST_HOME",
@@ -529,12 +517,46 @@ mod tests {
         );
         let legacy = tempfile::tempdir().unwrap();
         let isolated = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(legacy.path().join(".cc-switch")).unwrap();
-        std::fs::write(legacy.path().join(".cc-switch/cc-switch.db"), b"fixture").unwrap();
+        std::fs::create_dir_all(legacy.path().join(APP_DIR_NAME)).unwrap();
+        std::fs::write(
+            legacy.path().join(APP_DIR_NAME).join("cc-switch.db"),
+            b"fixture",
+        )
+        .unwrap();
         std::env::set_var("HOME", legacy.path());
         std::env::set_var("CC_SWITCH_TEST_HOME", isolated.path());
-        assert_eq!(get_app_config_dir(), isolated.path().join(".cc-switch"));
+        assert_eq!(get_app_config_dir(), isolated.path().join(APP_DIR_NAME));
         assert!(!get_app_config_dir().join("cc-switch.db").exists());
+    }
+
+    /// 独立程序边界：本 fork 绝不能落到上游 `~/.cc-switch`，
+    /// 否则两个程序共享同一个数据库并互相覆盖。
+    #[test]
+    #[serial_test::serial]
+    fn app_config_dir_never_resolves_to_upstream_cc_switch_dir() {
+        let _home = RestoreEnv("HOME", std::env::var_os("HOME"));
+        let _test_home = RestoreEnv(
+            "CC_SWITCH_TEST_HOME",
+            std::env::var_os("CC_SWITCH_TEST_HOME"),
+        );
+        let upstream_home = tempfile::tempdir().unwrap();
+        // 造出一份「上游数据库已存在」的现场：旧实现会在 Windows 上回退到它。
+        std::fs::create_dir_all(upstream_home.path().join(".cc-switch")).unwrap();
+        std::fs::write(
+            upstream_home.path().join(".cc-switch").join("cc-switch.db"),
+            b"upstream",
+        )
+        .unwrap();
+        std::env::set_var("HOME", upstream_home.path());
+        std::env::remove_var("CC_SWITCH_TEST_HOME");
+
+        let resolved = get_app_config_dir();
+        assert!(
+            !resolved.ends_with(".cc-switch"),
+            "must not resolve into the upstream data dir: {}",
+            resolved.display()
+        );
+        assert!(resolved.ends_with(APP_DIR_NAME));
     }
 
     fn assert_atomic_write_replaces_existing_file(dir: &Path) {

@@ -519,6 +519,12 @@ impl RequestForwarder {
         extensions: Extensions,
         providers: Vec<Provider>,
     ) -> Result<ForwardResult, ForwardError> {
+        if let (Some(trace), Some(model)) = (
+            extensions.get::<super::request_trace::RequestTrace>(),
+            body.get("model").and_then(Value::as_str),
+        ) {
+            trace.set_model(model);
+        }
         let guard = ActiveConnectionGuard::acquire(self.status.clone()).await;
         {
             let mut s = self.status.write().await;
@@ -1319,8 +1325,23 @@ impl RequestForwarder {
         // catalog matching and to the transform's own strip+beta detection).
         let codex_responses_to_chat = matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && super::providers::should_convert_codex_responses_to_chat(provider, endpoint);
+        let is_chat_endpoint = matches!(
+            split_endpoint_and_query(endpoint).0,
+            "/chat/completions" | "/v1/chat/completions"
+        );
+        // OpenAI Chat clients may be routed to a Responses or Anthropic gateway.
+        // Normalize the Chat request before URL construction so the upstream protocol
+        // and endpoint always agree with the selected route's explicit api_format.
+        let codex_chat_to_responses = matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && is_chat_endpoint
+            && !super::providers::codex_provider_uses_chat_completions(provider)
+            && !super::providers::codex_provider_uses_anthropic(provider);
+        let codex_chat_to_anthropic = matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && is_chat_endpoint
+            && super::providers::codex_provider_uses_anthropic(provider);
         let codex_responses_to_anthropic = matches!(app_type, AppType::Codex | AppType::GrokBuild)
-            && super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint);
+            && (super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
+                || codex_chat_to_anthropic);
         let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
             && super::providers::is_codex_official_provider(provider);
 
@@ -1578,8 +1599,14 @@ impl RequestForwarder {
                 == Some(true);
         let (effective_endpoint, passthrough_query) = if codex_responses_to_chat {
             rewrite_codex_responses_endpoint_to_chat(endpoint)
+        } else if codex_chat_to_responses {
+            rewrite_codex_chat_endpoint_to_responses(endpoint)
         } else if codex_responses_to_anthropic {
-            rewrite_codex_responses_endpoint_to_anthropic(endpoint)
+            if codex_chat_to_anthropic {
+                rewrite_codex_chat_endpoint_to_anthropic(endpoint)
+            } else {
+                rewrite_codex_responses_endpoint_to_anthropic(endpoint)
+            }
         } else if needs_transform && adapter.name() == "Claude" {
             let api_format = resolved_claude_api_format
                 .as_deref()
@@ -1596,6 +1623,9 @@ impl RequestForwarder {
 
         let codex_chat_base_is_full_endpoint =
             codex_responses_to_chat && base_url_is_full_endpoint(&base_url, "/chat/completions");
+
+        let codex_chat_to_responses_base_is_full_endpoint =
+            codex_chat_to_responses && base_url_is_full_endpoint(&base_url, "/responses");
 
         // Defensive fallback mirroring `codex_chat_base_is_full_endpoint`: if a user pastes
         // a base URL already ending in the Anthropic `/v1/messages` endpoint but leaves the
@@ -1618,6 +1648,7 @@ impl RequestForwarder {
             rewrite_codex_alpha_search_full_url(&base_url, passthrough_query.as_deref())?
         } else if is_full_url
             || codex_chat_base_is_full_endpoint
+            || codex_chat_to_responses_base_is_full_endpoint
             || codex_anthropic_base_is_full_endpoint
         {
             append_query_to_full_url(&base_url, passthrough_query.as_deref())
@@ -1639,7 +1670,15 @@ impl RequestForwarder {
         let mut codex_anthropic_one_m = false;
 
         // 转换请求体（如果需要）
-        let mut request_body = if codex_responses_to_chat {
+        let mut request_body = if codex_chat_to_responses {
+            let mut responses_body =
+                super::providers::transform_chat_entry::chat_request_for_upstream(
+                    mapped_body,
+                    false,
+                )?;
+            super::providers::apply_codex_upstream_model(provider, &mut responses_body);
+            responses_body
+        } else if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
             let explicit_prompt_cache_key = mapped_body
                 .get("prompt_cache_key")
@@ -1670,7 +1709,14 @@ impl RequestForwarder {
             );
             chat_body
         } else if codex_responses_to_anthropic {
-            let mut mapped_body = mapped_body;
+            let mut mapped_body = if codex_chat_to_anthropic {
+                super::providers::transform_chat_entry::chat_request_for_upstream(
+                    mapped_body,
+                    true,
+                )?
+            } else {
+                mapped_body
+            };
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
             // Per-provider output ceiling override. Codex does not forward its
             // `model_max_output_tokens` in the request body, so honor the value
@@ -1751,6 +1797,8 @@ impl RequestForwarder {
         // xAI request rewrites (schema, agent_message, unknown models).
         if matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && !codex_responses_to_chat
+            && !codex_chat_to_responses
+            && !codex_chat_to_anthropic
             && !codex_responses_to_anthropic
             && super::providers::provider_needs_responses_namespace_flatten(provider)
         {
@@ -1828,6 +1876,7 @@ impl RequestForwarder {
         let request_is_streaming =
             is_streaming_request(&effective_endpoint, &filtered_body, headers);
         let force_identity_encoding = needs_transform
+            || codex_chat_to_responses
             || codex_responses_to_chat
             || codex_responses_to_anthropic
             || request_is_streaming;
@@ -2332,9 +2381,13 @@ impl RequestForwarder {
             );
         }
 
-        // Codex→Anthropic emulation: inject Claude Code's x-app: cli
+        // Codex→Anthropic emulation: inject Claude Code's x-app: cli plus the
+        // Anthropic SDK header set the Codex client never sends.
         if codex_impersonate_claude_code {
             ordered_headers.append("x-app", http::HeaderValue::from_static("cli"));
+            for (name, value) in claude_code_stainless_headers() {
+                ordered_headers.insert(name, value);
+            }
         }
 
         if !saw_user_agent {
@@ -2459,10 +2512,41 @@ impl RequestForwarder {
             provider,
             resolved_claude_api_format.as_deref(),
             is_copilot,
+            codex_impersonate_claude_code,
         );
 
         // A 401/429 still proves the exit node worked; only transport errors and
         // proxy authentication failures should trip the node circuit.
+        let outbound_protocol = if codex_responses_to_anthropic {
+            "anthropic"
+        } else if codex_responses_to_chat {
+            "openai_chat"
+        } else if codex_chat_to_responses {
+            "openai_responses"
+        } else if let Some(format) = resolved_claude_api_format.as_deref() {
+            format
+        } else if matches!(app_type, AppType::Gemini) {
+            "gemini_native"
+        } else if is_chat_endpoint {
+            "openai_chat"
+        } else {
+            "openai_responses"
+        };
+        let trace_attempt = extensions
+            .get::<super::request_trace::RequestTrace>()
+            .map(|trace| {
+                trace.start_attempt(
+                    provider,
+                    method,
+                    &url,
+                    &ordered_headers,
+                    &body_bytes,
+                    outbound_protocol,
+                    outbound_model.as_deref(),
+                    upstream_proxy_url.as_deref(),
+                    &log_secrets,
+                )
+            });
         let transport_started = std::time::Instant::now();
         let transport_result: Result<ProxyResponse, ProxyError> = async {
         let response = if is_socks_proxy || !preserve_exact_header_case {
@@ -2515,12 +2599,20 @@ impl RequestForwarder {
             let uri: http::Uri = url.parse().map_err(|e| {
                 ProxyError::ForwardFailed(format!("Invalid upstream URL ({target_for_log}): {e}"))
             })?;
+            // While impersonating Claude Code, replay the Anthropic SDK's header
+            // order instead of the incoming Codex client's. Keeping Codex's order
+            // under a claude-cli User-Agent is an internal contradiction; the rest
+            // of this path already rebuilds the request to match the native client.
+            let mut extensions = extensions.clone();
+            if codex_impersonate_claude_code {
+                extensions.insert(claude_code_impersonation_header_order());
+            }
             super::hyper_client::send_request(
                 uri,
                 &target_for_log,
                 method.clone(),
                 ordered_headers,
-                extensions.clone(),
+                extensions,
                 body_bytes,
                 timeout,
                 upstream_proxy_url.as_deref(),
@@ -2545,7 +2637,18 @@ impl RequestForwarder {
                 .await;
             }
         }
-        let response = transport_result?;
+        let response = match transport_result {
+            Ok(response) => match &trace_attempt {
+                Some(attempt) => attempt.observe_response(response),
+                None => response,
+            },
+            Err(error) => {
+                if let Some(attempt) = &trace_attempt {
+                    attempt.transport_error(&error.to_string());
+                }
+                return Err(error);
+            }
+        };
 
         // 检查响应状态
         let status = response.status();
@@ -2558,14 +2661,26 @@ impl RequestForwarder {
             // explicitly returns JSON instead, buffer and validate it inside the retry
             // loop as well so a 2xx Anthropic error envelope can still fail over. Do
             // not buffer unknown content types: some gateways omit the SSE header.
-            if codex_responses_to_anthropic && (!request_is_streaming || response.is_json()) {
+            if (codex_responses_to_anthropic
+                || (super::gateway_route::is_gateway_provider(provider)
+                    && resolved_claude_api_format.as_deref() == Some("anthropic")))
+                && (!request_is_streaming || response.is_json())
+            {
                 response = self
                     .validate_codex_anthropic_success_response(response)
                     .await?;
-            } else if matches!(
-                resolved_claude_api_format.as_deref(),
-                Some("openai_responses")
-            ) {
+            } else if codex_chat_to_responses
+                || (super::gateway_route::is_gateway_provider(provider)
+                    && provider
+                        .settings_config
+                        .get("api_format")
+                        .and_then(Value::as_str)
+                        == Some("openai_responses"))
+                || matches!(
+                    resolved_claude_api_format.as_deref(),
+                    Some("openai_responses")
+                )
+            {
                 if !request_is_streaming || response.is_json() {
                     // Claude→Responses gateways can also return a semantic failure in an
                     // HTTP 2xx Response object. Validate buffered/JSON bodies inside the
@@ -2706,17 +2821,19 @@ impl RequestForwarder {
         const MAX_PRIME_BYTES: usize = 256 * 1024;
 
         let status = response.status();
-        let headers = response.headers().clone();
+        let mut headers = response.headers().clone();
         let mut stream = Box::pin(response.bytes_stream());
         let mut replay_chunks: Vec<Bytes> = Vec::new();
         let mut parse_buffer = String::new();
         let mut utf8_remainder = Vec::new();
+        let mut primed_bytes = 0usize;
+        let deadline = tokio::time::Instant::now() + self.streaming_first_byte_timeout;
 
         loop {
             let next = if self.streaming_first_byte_timeout.is_zero() {
                 stream.next().await
             } else {
-                tokio::time::timeout(self.streaming_first_byte_timeout, stream.next())
+                tokio::time::timeout_at(deadline, stream.next())
                     .await
                     .map_err(|_| {
                         ProxyError::Timeout(format!(
@@ -2729,6 +2846,10 @@ impl RequestForwarder {
             let Some(chunk) = next else {
                 if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
                     outcome?;
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_static("application/json"),
+                    );
                     let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                     return Ok(ProxyResponse::streamed(status, headers, replay));
                 }
@@ -2750,6 +2871,7 @@ impl RequestForwarder {
                 ))
             })?;
             crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
+            primed_bytes = primed_bytes.saturating_add(chunk.len());
             replay_chunks.push(chunk);
 
             // Some compatible gateways ignore `stream:true` and return a complete
@@ -2758,6 +2880,10 @@ impl RequestForwarder {
             // contain blank lines and must stay intact.
             if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
                 outcome?;
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
+                );
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
             }
@@ -2771,7 +2897,7 @@ impl RequestForwarder {
                 }
             }
 
-            if replay_chunks.iter().map(Bytes::len).sum::<usize>() >= MAX_PRIME_BYTES {
+            if primed_bytes >= MAX_PRIME_BYTES {
                 log::warn!(
                     "[Claude/Responses] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
                 );
@@ -3131,11 +3257,174 @@ fn rewrite_codex_responses_endpoint_to_chat(endpoint: &str) -> (String, Option<S
     (rewritten, passthrough_query)
 }
 
+fn rewrite_codex_chat_endpoint_to_responses(endpoint: &str) -> (String, Option<String>) {
+    let (_path, query) = split_endpoint_and_query(endpoint);
+    let passthrough_query = query.map(ToString::to_string);
+    let target_path = "/responses";
+    let rewritten = match passthrough_query.as_deref() {
+        Some(query) if !query.is_empty() => format!("{target_path}?{query}"),
+        _ => target_path.to_string(),
+    };
+    (rewritten, passthrough_query)
+}
+
+fn rewrite_codex_chat_endpoint_to_anthropic(endpoint: &str) -> (String, Option<String>) {
+    let (_path, query) = split_endpoint_and_query(endpoint);
+    let passthrough_query = query.map(ToString::to_string);
+    let target_path = "/v1/messages";
+    let rewritten = match passthrough_query.as_deref() {
+        Some(query) if !query.is_empty() => format!("{target_path}?{query}"),
+        _ => target_path.to_string(),
+    };
+    (rewritten, passthrough_query)
+}
+
 /// Claude Code client fingerprint (used for Codex→Anthropic emulation to pass a
 /// gateway's "Claude Code only" check).
-const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/1.0.119 (external, cli)";
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.258 (external, cli)";
 const CLAUDE_CODE_SYSTEM_IDENTITY: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Anthropic TypeScript SDK (stainless) version that ships inside the Claude Code
+/// build named in [`CLAUDE_CODE_USER_AGENT`]. The two are a matched pair: bumping
+/// the CLI version without bumping this one produces a combination no real client
+/// emits, which is worse than sending neither.
+const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION: &str = "0.112.1";
+
+/// Node runtime bundled with that same Claude Code build.
+const CLAUDE_CODE_STAINLESS_RUNTIME_VERSION: &str = "v26.3.0";
+
+/// `X-Stainless-Timeout` the SDK derives from Claude Code's request timeout.
+const CLAUDE_CODE_STAINLESS_TIMEOUT: &str = "600";
+
+/// Map the host platform onto the names Node's `os.platform()` reports and the
+/// stainless SDK forwards. Reporting the real platform keeps the fingerprint
+/// self-consistent with everything else the OS leaks (TCP/TLS timing, locale),
+/// which a hardcoded "MacOS" would contradict on a Windows host.
+fn claude_code_stainless_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "MacOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "freebsd" => "FreeBSD",
+        "openbsd" => "OpenBSD",
+        "android" => "Android",
+        _ => "Unknown",
+    }
+}
+
+/// Map the host architecture onto Node's `os.arch()` names.
+fn claude_code_stainless_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        "arm" => "arm",
+        "powerpc64" => "ppc64",
+        "s390x" => "s390x",
+        _ => "Unknown",
+    }
+}
+
+/// Header set the Anthropic TS SDK attaches to every Messages request, which the
+/// Codex client never sends. Emitting the Claude Code User-Agent while omitting
+/// these is a sharper tell than sending an unremarkable extra header: the pairing
+/// is fixed in the real client, so a UA/SDK-header mismatch is trivially checkable.
+///
+/// Order and casing are applied separately by
+/// [`claude_code_impersonation_header_order`]; this only supplies name/value pairs.
+fn claude_code_stainless_headers() -> Vec<(http::HeaderName, http::HeaderValue)> {
+    let mut headers: Vec<(http::HeaderName, http::HeaderValue)> = vec![
+        (
+            http::HeaderName::from_static("x-stainless-lang"),
+            http::HeaderValue::from_static("js"),
+        ),
+        (
+            http::HeaderName::from_static("x-stainless-package-version"),
+            http::HeaderValue::from_static(CLAUDE_CODE_STAINLESS_PACKAGE_VERSION),
+        ),
+        (
+            http::HeaderName::from_static("x-stainless-runtime"),
+            http::HeaderValue::from_static("node"),
+        ),
+        (
+            http::HeaderName::from_static("x-stainless-runtime-version"),
+            http::HeaderValue::from_static(CLAUDE_CODE_STAINLESS_RUNTIME_VERSION),
+        ),
+        (
+            http::HeaderName::from_static("x-stainless-os"),
+            http::HeaderValue::from_static(claude_code_stainless_os()),
+        ),
+        (
+            http::HeaderName::from_static("x-stainless-arch"),
+            http::HeaderValue::from_static(claude_code_stainless_arch()),
+        ),
+        // The proxy performs its own retries by re-entering the forwarder, so from
+        // the SDK's point of view every outbound attempt is the first one.
+        (
+            http::HeaderName::from_static("x-stainless-retry-count"),
+            http::HeaderValue::from_static("0"),
+        ),
+        (
+            http::HeaderName::from_static("x-stainless-timeout"),
+            http::HeaderValue::from_static(CLAUDE_CODE_STAINLESS_TIMEOUT),
+        ),
+        (
+            http::HeaderName::from_static("anthropic-dangerous-direct-browser-access"),
+            http::HeaderValue::from_static("true"),
+        ),
+    ];
+
+    // Fresh per request in the real client, so a stable value would stand out
+    // across a conversation.
+    if let Ok(value) = http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
+        headers.push((http::HeaderName::from_static("x-client-request-id"), value));
+    }
+
+    headers
+}
+
+/// Wire order and casing the Anthropic TS SDK produces for a Messages request.
+///
+/// The forwarder normally replays the client's own header order, but on this path
+/// the incoming request came from Codex — its order describes a client we are not
+/// claiming to be. Substituting the native order means the reconstructed request
+/// matches the UA it advertises. Names absent from the outbound header map are
+/// skipped by the raw writer, and any header not listed here is appended after
+/// these (Content-Length is emitted last by the writer itself).
+fn claude_code_impersonation_header_order() -> super::hyper_client::OriginalHeaderCases {
+    const ORDER: &[&str] = &[
+        "Accept",
+        "Authorization",
+        "Content-Type",
+        "User-Agent",
+        "X-Claude-Code-Session-Id",
+        "X-Stainless-Arch",
+        "X-Stainless-Lang",
+        "X-Stainless-OS",
+        "X-Stainless-Package-Version",
+        "X-Stainless-Retry-Count",
+        "X-Stainless-Runtime",
+        "X-Stainless-Runtime-Version",
+        "X-Stainless-Timeout",
+        "anthropic-beta",
+        "anthropic-dangerous-direct-browser-access",
+        "anthropic-version",
+        "x-api-key",
+        "x-app",
+        "x-client-request-id",
+        "Connection",
+        "Host",
+        "Accept-Encoding",
+    ];
+
+    super::hyper_client::OriginalHeaderCases {
+        cases: ORDER
+            .iter()
+            .map(|name| (name.to_ascii_lowercase(), name.as_bytes().to_vec()))
+            .collect(),
+    }
+}
 
 /// Insert the Claude Code identity as the first line before the `system` field in
 /// the Anthropic request body.
@@ -3591,7 +3880,18 @@ fn should_preserve_exact_header_case(
     provider: &Provider,
     resolved_claude_api_format: Option<&str>,
     is_copilot: bool,
+    codex_impersonate_claude_code: bool,
 ) -> bool {
+    // Impersonating Claude Code means the outbound request must match the native
+    // client on the wire, and over HTTP/1.1 header casing and order are part of
+    // that wire. The pooled reqwest path lowercases every name and emits them in
+    // HeaderMap order, which would contradict the claude-cli User-Agent this path
+    // sends. Routing it through the raw writer costs the connection pool but is
+    // the only way the casing/order claim holds.
+    if codex_impersonate_claude_code {
+        return true;
+    }
+
     if matches!(adapter_name, "Codex" | "Gemini") {
         return false;
     }
@@ -4398,19 +4698,25 @@ mod tests {
             "Claude",
             &provider,
             Some("anthropic"),
+            false,
             false
         ));
         assert!(!should_preserve_exact_header_case(
             "Claude",
             &provider,
             Some("openai_responses"),
+            false,
             false
         ));
         assert!(!should_preserve_exact_header_case(
-            "Codex", &provider, None, false
+            "Codex", &provider, None, false, false
         ));
         assert!(!should_preserve_exact_header_case(
-            "Gemini", &provider, None, false
+            "Gemini", &provider, None, false, false
+        ));
+        // Impersonation overrides the Codex default so casing/order stay native.
+        assert!(should_preserve_exact_header_case(
+            "Codex", &provider, None, false, true
         ));
     }
 
@@ -4423,13 +4729,15 @@ mod tests {
             "Claude",
             &codex_oauth,
             Some("openai_responses"),
+            false,
             false
         ));
         assert!(!should_preserve_exact_header_case(
             "Claude",
             &copilot,
             Some("openai_chat"),
-            true
+            true,
+            false
         ));
     }
 

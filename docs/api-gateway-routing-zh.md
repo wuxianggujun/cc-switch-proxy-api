@@ -2,7 +2,7 @@
 
 本文记录「API 接入」功能的当前实现状态、设计决策与未决问题。
 
-**状态：已补齐主要接线并加入本地 HTTP 联调。** 本文已按 2026-09-08 的修复更新；使用步骤、验证方式和剩余边界见 `readiness-review-2026-09-08-zh.md`。本地测试不等于真实付费上游和网站验收。
+**状态：已接通 Claude/OpenAI 三协议双向转发与请求日志。** 最新使用步骤、协议矩阵和验证说明见 `protocol-routing-request-logs-2026-09-09-zh.md`；早期轮询、签到和代理池检查见 `readiness-review-2026-09-08-zh.md`。
 
 ## 背景
 
@@ -20,12 +20,12 @@
 | 优先级字段 | 复用 `sort_index`（展示序兼任） | 独立 `priority` / `internal_priority` |
 | 路由决定时机 | 切换那一刻写死 | 每个请求 |
 
-**分叉判据**（`proxy/handler_context.rs` 的 `select_gateway_providers`）：查询该兼容协议族有无启用的接入点。有则走新链，无则回落老链。配置存在但 key 不可用或模型不匹配，是网关不可用，不是未配置。
+**分叉判据**（`proxy/handler_context.rs` 的 `select_gateway_providers`）：查询本协议族启用的接入点，并允许 Claude/OpenAI 跨族接入点通过显式模型白名单加入。有则走新链，无则回落老链。配置存在但 key 不可用或模型不匹配，是网关不可用，不是未配置。
 
 因此：
 
 - API 接入页一条未配 → 全部请求走老链，行为与改造前一致
-- 只在 Claude 下配了接入 → Claude 走新链，Codex / Gemini 仍走老链
+- 只在 Claude 下配了接入且白名单留空 → Claude 走新链，Codex / Gemini 仍走老链；显式声明模型后，Codex/Chat 可跨协议选中它
 - 接入全部停用 → 未启用该网关 → 回落老链
 - 接入启用但 key 全部不可用、模型不匹配 → 返回不可用，不回落旧账号
 - 选线查询报错 → 显式返回数据库错误，不静默改变账号与计费来源
@@ -82,19 +82,21 @@ ORDER BY e.priority ASC,                  -- 层级，越小越优先
 
 ## 合成 Provider
 
-所有 adapter 的凭据都从 `Provider.settings_config` JSON 读取。因此接线最省的做法是把选线候选**合成为临时 Provider**（`proxy/gateway_route.rs`），整条转发链、全部协议转换器零改动复用。
+所有 adapter 的凭据都从 `Provider.settings_config` JSON 读取。选线候选**合成为临时 Provider**（`proxy/gateway_route.rs`）以复用既有 adapter；转发层必须同时根据入口协议和上游协议处理请求、响应与 SSE，不能把“合成 Provider”误认为已经完成跨协议接线。
 
 各上游的写入路径必须与 adapter 的读取路径对齐，否则 adapter 取不到凭据会报 ConfigError：
 
 | 上游 | base_url 落点 | key 落点 |
 |---|---|---|
-| Claude | `env.ANTHROPIC_BASE_URL` | `env.ANTHROPIC_AUTH_TOKEN` |
+| Claude | `env.ANTHROPIC_BASE_URL` | `env.ANTHROPIC_API_KEY` |
 | OpenAI / Codex / DeepSeek | `base_url`（顶层）+ `env.OPENAI_BASE_URL` | `env.OPENAI_API_KEY` |
 | Gemini | `env.GOOGLE_GEMINI_BASE_URL` | `env.GEMINI_API_KEY` |
 
 同时冗余写入顶层 `base_url` 与 `api_key`，覆盖 adapter 的回退分支。
 
 同时写入 `api_format`：OpenAI / DeepSeek 为 `openai_chat`，Codex 为 `openai_responses`，以便 Responses 客户端正确触发 Chat 转换。
+
+OpenAI 族另标记 `auth_mode=bearer_only`，保证从 Claude 入口调用也使用 Bearer；Claude 接入标记 `api_key_field=ANTHROPIC_API_KEY`，保证从 Codex/Chat 入口调用也使用 `x-api-key`。
 
 两个刻意的选择：
 
@@ -103,7 +105,7 @@ ORDER BY e.priority ASC,                  -- 层级，越小越优先
 
 ## 哪些 app 不走网关
 
-`gateway_upstreams_for` 只映射 `Claude` / `Codex` / `Gemini`。Codex 请求可使用 Codex、OpenAI、DeepSeek 三类接入点；Claude 与 Gemini 分别选择原生协议族。
+`gateway_upstreams_for` 映射 `Claude` / `Codex` / `Gemini` 的本族候选。Claude 与 Codex/Chat 还允许显式白名单命中的兼容跨族候选；同族先于跨族。Gemini 仍只使用原生协议族，不参与 Claude/OpenAI 的跨族选线。
 
 OpenClaw、Hermes、Pi、GrokBuild、OpenCode 的专有接管命名空间暂不进入新链。这不代表这些客户端只能使用 OAuth：其中一些同样支持 API Key，也可以按协议手动指向通用网关入口。当前映射反映的是本轮接线范围，而不是这些客户端的完整能力。
 
@@ -133,7 +135,7 @@ OpenClaw、Hermes、Pi、GrokBuild、OpenCode 的专有接管命名空间暂不�
 
 **4. token / cost 未落到 key 记账。** `record_api_key_success` 传 0，用量仍由 `proxy_request_logs` 统计。key 统计目前是请求/成败维度，不是完整的 key 级计费报表。
 
-**5. 网关健康状态由 key 表管理。** 不再与旧 provider 熔断器重复判罚；请求日志仍以 `gw:{key_id}` 标识，需要在未来的 key 级报表里明确区分。
+**5. 网关健康状态由 key 表管理。** 不再与旧 provider 熔断器重复判罚；计费用量仍以 `gw:{key_id}` 标识。新的请求日志页面同时展示接入点显示名、实际协议、模型、每次尝试和原始报文，独立于 key 级计费报表。
 
 ## 未决设计：轮询与固定指定
 

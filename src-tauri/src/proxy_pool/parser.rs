@@ -264,7 +264,7 @@ fn parse_proxy_uri(raw: &str) -> Option<ProxyNode> {
     let protocol = NodeProtocol::parse(parsed.scheme())?;
     let host = parsed.host_str()?.to_string();
     // 无显式端口时按协议取默认值
-    let port = parsed.port().or_else(|| match protocol {
+    let port = parsed.port().or(match protocol {
         NodeProtocol::Http => Some(80),
         NodeProtocol::Https => Some(443),
         NodeProtocol::Socks5 => Some(1080),

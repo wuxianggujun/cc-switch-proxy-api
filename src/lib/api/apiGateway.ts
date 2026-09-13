@@ -2,11 +2,17 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ApiEndpoint,
   ApiKey,
-  NewApiEndpoint,
+  CreatedApiEndpoint,
+  GatewayModelFetchDraft,
+  KeyMutationOutcome,
+  NewApiEndpointWithKey,
   NewApiKey,
   RouteCandidate,
+  UpdatedApiEndpoint,
+  UpdateApiEndpointInput,
   UpstreamType,
 } from "@/types/apiGateway";
+import type { FetchedModel } from "@/lib/api/model-fetch";
 
 export const apiGatewayApi = {
   // ── 接入点 ──────────────────────────────────────────
@@ -15,12 +21,20 @@ export const apiGatewayApi = {
     return invoke("list_api_endpoints");
   },
 
-  createEndpoint(endpoint: NewApiEndpoint): Promise<string> {
-    return invoke("create_api_endpoint", { endpoint });
+  createEndpoint(input: NewApiEndpointWithKey): Promise<CreatedApiEndpoint> {
+    return invoke("create_api_endpoint_with_key", { input });
   },
 
-  updateEndpoint(endpoint: ApiEndpoint): Promise<void> {
-    return invoke("update_api_endpoint", { endpoint });
+  updateEndpoint(input: UpdateApiEndpointInput): Promise<UpdatedApiEndpoint> {
+    return invoke("update_api_endpoint", { input });
+  },
+
+  fetchDraftModels(input: GatewayModelFetchDraft): Promise<FetchedModel[]> {
+    return invoke("fetch_api_gateway_draft_models", { input });
+  },
+
+  fetchEndpointModels(endpointId: string): Promise<FetchedModel[]> {
+    return invoke("fetch_api_endpoint_models", { endpointId });
   },
 
   deleteEndpoint(endpointId: string): Promise<void> {
@@ -46,11 +60,11 @@ export const apiGatewayApi = {
     return invoke("create_api_key", { key });
   },
 
-  deleteKey(keyId: string): Promise<void> {
+  deleteKey(keyId: string): Promise<KeyMutationOutcome> {
     return invoke("delete_api_key", { keyId });
   },
 
-  setKeyEnabled(keyId: string, enabled: boolean): Promise<void> {
+  setKeyEnabled(keyId: string, enabled: boolean): Promise<KeyMutationOutcome> {
     return invoke("set_api_key_enabled", { keyId, enabled });
   },
 

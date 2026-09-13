@@ -239,7 +239,7 @@ fn runtime_log_level_allows(level: log::Level, max_level: log::LevelFilter) -> b
     max_level.to_level().is_some_and(|maximum| level <= maximum)
 }
 
-/// 统一处理 ccswitch:// 深链接 URL
+/// 统一处理 ccswitchproxy:// 深链接 URL
 ///
 /// - 解析 URL
 /// - 向前端发射 `deeplink-import` / `deeplink-error` 事件
@@ -250,7 +250,7 @@ fn handle_deeplink_url(
     focus_main_window: bool,
     source: &str,
 ) -> bool {
-    if !url_str.starts_with("ccswitch://") {
+    if !url_str.starts_with("ccswitchproxy://") {
         return false;
     }
 
@@ -409,6 +409,10 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
+            // Account/verification windows own their lifecycle; closing one must never exit the app.
+            if window.label() != "main" {
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // 数据库版本过新的恢复模式下没有托盘可唤回，关闭即退出，避免应用隐身后台
                 let in_db_recovery = crate::init_status::get_init_error()
@@ -480,7 +484,7 @@ pub fn run() {
                             Target::new(TargetKind::Stdout),
                             Target::new(TargetKind::Folder {
                                 path: log_dir,
-                                file_name: Some("cc-switch".into()),
+                                file_name: Some("cc-switch-proxy".into()),
                             }),
                         ])
                         // KeepSome(4) 保留 4 个轮转归档，加上当前文件最多约 100 MiB。
@@ -493,7 +497,7 @@ pub fn run() {
 
                 // 用户配置存在数据库中，数据库尚未打开时使用保守的 Info 级别。
                 log::set_max_level(log::LevelFilter::Info);
-                log::info!("=== CC Switch v{} started ===", env!("CARGO_PKG_VERSION"));
+                log::info!("=== CC Switch Proxy v{} started ===", env!("CARGO_PKG_VERSION"));
             }
 
             // 首次读取覆盖路径时 logger 尚未可用；此处重放一次，
@@ -502,18 +506,6 @@ pub fn run() {
 
             #[cfg(target_os = "windows")]
             set_windows_app_user_model_id(app.handle());
-
-            // 注册 Updater 插件（桌面端）；放在 logger 之后，确保失败可诊断。
-            #[cfg(desktop)]
-            {
-                if let Err(e) = app
-                    .handle()
-                    .plugin(tauri_plugin_updater::Builder::new().build())
-                {
-                    // 若配置不完整（如缺少 pubkey），跳过 Updater 而不中断应用
-                    log::warn!("初始化 Updater 插件失败，已跳过：{e}");
-                }
-            }
 
             // 注入 AppHandle 给 usage_events，让无 AppHandle 持有的写日志路径
             // 也能向前端推送 `usage-log-recorded`。
@@ -1020,7 +1012,7 @@ pub fn run() {
                 #[cfg(target_os = "linux")]
                 {
                     // Use Tauri's path API to get correct path (includes app identifier)
-                    // tauri-plugin-deep-link writes to: ~/.local/share/com.ccswitch.desktop/applications/cc-switch-handler.desktop
+                    // tauri-plugin-deep-link writes to: ~/.local/share/com.wuxianggujun.ccswitchproxy/applications/cc-switch-handler.desktop
                     // Only register if .desktop file doesn't exist to avoid overwriting user customizations
                     let should_register = app
                         .path()
@@ -1068,7 +1060,7 @@ pub fn run() {
                         log::debug!("  URL[{i}]: {}", url_for_log(url_str));
 
                         if handle_deeplink_url(&app_handle, url_str, true, "on_open_url") {
-                            break; // Process only first ccswitch:// URL
+                            break; // Process only first ccswitchproxy:// URL
                         }
                     }
                 }
@@ -1080,7 +1072,7 @@ pub fn run() {
 
             // 构建托盘
             let mut tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
-                .tooltip("CC Switch") // 鼠标悬停提示
+                .tooltip("CC Switch Proxy") // 鼠标悬停提示
                 .on_tray_icon_event(|tray, event| match event {
                     // 鼠标悬停/点击到托盘图标时，后台异步刷新用量缓存，
                     // 让用户下一次（或快速打开菜单的那一刻）看到较新的数字。
@@ -1436,9 +1428,6 @@ pub fn run() {
             commands::get_log_config,
             commands::set_log_config,
             commands::restart_app,
-            commands::install_update_and_restart,
-            commands::check_app_update_available,
-            commands::check_for_updates,
             commands::is_portable_mode,
             commands::copy_text_to_clipboard,
             commands::get_claude_plugin_status,
@@ -1610,7 +1599,7 @@ pub fn run() {
             commands::set_auto_failover_enabled,
             // API gateway: endpoints & keys
             commands::list_api_endpoints,
-            commands::create_api_endpoint,
+            commands::create_api_endpoint_with_key,
             commands::update_api_endpoint,
             commands::delete_api_endpoint,
             commands::reorder_api_endpoints,
@@ -1621,6 +1610,8 @@ pub fn run() {
             commands::set_api_key_enabled,
             commands::clear_api_key_penalty,
             commands::preview_route_candidates,
+            commands::fetch_api_gateway_draft_models,
+            commands::fetch_api_endpoint_models,
             // Usage statistics
             commands::get_usage_summary,
             commands::get_usage_summary_by_app,
@@ -1629,6 +1620,11 @@ pub fn run() {
             commands::get_model_stats,
             commands::get_request_logs,
             commands::get_request_detail,
+            commands::list_request_traces,
+            commands::get_request_trace,
+            commands::get_request_trace_config,
+            commands::set_request_trace_config,
+            commands::clear_request_traces,
             commands::get_model_pricing,
             commands::update_model_pricing,
             commands::update_model_pricing_batch,
@@ -1699,6 +1695,8 @@ pub fn run() {
             commands::run_checkin_site,
             commands::run_all_checkin_sites,
             commands::refresh_checkin_clearance,
+            commands::open_checkin_login_window,
+            commands::get_checkin_browser_session_status,
             // Global upstream proxy
             commands::get_global_proxy_url,
             commands::set_global_proxy_url,
@@ -1853,7 +1851,7 @@ pub fn run() {
                         }
                     }
                 }
-                // 处理通过自定义 URL 协议触发的打开事件（例如 ccswitch://...）
+                // 处理通过自定义 URL 协议触发的打开事件（例如 ccswitchproxy://...）
                 RunEvent::Opened { urls } => {
                     if let Some(url) = urls.first() {
                         let url_str = url.to_string();
@@ -1862,7 +1860,7 @@ pub fn run() {
                             url_for_log(&url_str)
                         );
 
-                        if url_str.starts_with("ccswitch://") {
+                        if url_str.starts_with("ccswitchproxy://") {
                             if crate::lightweight::is_lightweight_mode() {
                                 if let Err(e) = crate::lightweight::exit_lightweight_mode(app_handle)
                                 {

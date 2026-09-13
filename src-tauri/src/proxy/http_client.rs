@@ -40,7 +40,7 @@ fn get_proxy_port() -> u16 {
         .get()
         .and_then(|lock| lock.read().ok())
         .map(|port| *port)
-        .unwrap_or(15721) // 默认端口作为回退
+        .unwrap_or(crate::config::DEFAULT_LISTEN_PORT) // 默认端口作为回退
 }
 
 /// 初始化全局 HTTP 客户端
@@ -266,6 +266,11 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .connect_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .tcp_keepalive(Duration::from_secs(60))
+        // 注意：这个 client 被 Codex / Gemini / Copilot 转发和它们的 OAuth 流共用，
+        // 而这些后端的原生客户端（Codex CLI 用 reqwest、Copilot 走 VSCode/Node）本身
+        // 就协商 h2。所以这里保留 reqwest 默认的 ALPN（h2 + http/1.1），不要锁成
+        // http1_only —— 那会让这些路径更不像原生客户端。Anthropic 方向的 h1 对齐由
+        // hyper_client 的裸写路径负责，它明确只报 http/1.1。
         // 禁用 reqwest 自动解压：防止 reqwest 覆盖客户端原始 accept-encoding header。
         // 响应解压由 response_processor 根据 content-encoding 手动处理。
         .no_gzip()

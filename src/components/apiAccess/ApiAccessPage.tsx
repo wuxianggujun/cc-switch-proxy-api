@@ -106,6 +106,12 @@ export function ApiAccessPage() {
     toast.error(t("apiAccess.toast.failed", { error: String(error) }));
   };
 
+  const reportAutoDisabled = (endpointAutoDisabled: boolean) => {
+    if (endpointAutoDisabled) {
+      toast.warning(t("apiAccess.toast.endpointAutoDisabled"));
+    }
+  };
+
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
     if (!over || active.id === over.id) return;
@@ -135,13 +141,29 @@ export function ApiAccessPage() {
 
   const submitEndpoint = async (values: EndpointFormValues) => {
     try {
+      const { apiKey, ...endpointValues } = values;
+      let endpointId: string;
+
       if (editing) {
-        await updateEndpoint.mutateAsync({ ...editing, ...values });
+        const result = await updateEndpoint.mutateAsync({
+          endpointId: editing.id,
+          ...endpointValues,
+          ...(apiKey ? { newKey: { apiKey } } : {}),
+        });
+        endpointId = result.endpointId;
         toast.success(t("apiAccess.toast.updated"));
       } else {
-        await createEndpoint.mutateAsync(values);
+        if (!apiKey) return;
+        const result = await createEndpoint.mutateAsync({
+          endpoint: endpointValues,
+          firstKey: { apiKey },
+        });
+        endpointId = result.endpointId;
         toast.success(t("apiAccess.toast.created"));
       }
+
+      setSelectedUpstream(values.upstreamType);
+      setExpandedId(endpointId);
       setFormOpen(false);
       setEditing(undefined);
     } catch (error) {
@@ -179,8 +201,9 @@ export function ApiAccessPage() {
   const confirmDeleteKey = async () => {
     if (!deleteKeyTarget) return;
     try {
-      await deleteKey.mutateAsync(deleteKeyTarget.id);
+      const outcome = await deleteKey.mutateAsync(deleteKeyTarget.id);
       toast.success(t("apiAccess.toast.keyDeleted"));
+      reportAutoDisabled(outcome.endpointAutoDisabled);
     } catch (error) {
       reportFailure(error);
     } finally {
@@ -189,43 +212,38 @@ export function ApiAccessPage() {
   };
 
   return (
-    <div className="flex flex-col gap-4">
-      <header className="flex items-center justify-between">
-        <div>
-          <p className="text-xs font-medium tracking-wider text-muted-foreground">
-            {t("apiAccess.subtitle")}
-          </p>
-          <h1 className="text-2xl font-semibold">{t("apiAccess.title")}</h1>
-        </div>
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-muted-foreground">
-            {t("apiAccess.count", { count: endpoints.length })}
-          </span>
-          <Button
-            variant="outline"
-            onClick={() => refetch()}
-            disabled={isFetching}
-          >
-            <RefreshCw
-              className={
-                isFetching ? "mr-2 h-4 w-4 animate-spin" : "mr-2 h-4 w-4"
-              }
-            />
-            {t("apiAccess.refresh")}
-          </Button>
-          <Button
-            onClick={() => {
-              setEditing(undefined);
-              setFormOpen(true);
-            }}
-          >
-            <Plus className="mr-2 h-4 w-4" />
-            {t("apiAccess.add")}
-          </Button>
-        </div>
-      </header>
-
-      <GatewayStatusBar upstream={selectedUpstream} />
+    <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-4 px-6 py-6">
+      <GatewayStatusBar
+        upstream={selectedUpstream}
+        actions={
+          <>
+            <span className="text-sm text-muted-foreground">
+              {t("apiAccess.count", { count: endpoints.length })}
+            </span>
+            <Button
+              variant="outline"
+              onClick={() => refetch()}
+              disabled={isFetching}
+            >
+              <RefreshCw
+                className={
+                  isFetching ? "mr-2 h-4 w-4 animate-spin" : "mr-2 h-4 w-4"
+                }
+              />
+              {t("apiAccess.refresh")}
+            </Button>
+            <Button
+              onClick={() => {
+                setEditing(undefined);
+                setFormOpen(true);
+              }}
+            >
+              <Plus className="mr-2 h-4 w-4" />
+              {t("apiAccess.add")}
+            </Button>
+          </>
+        }
+      />
 
       <div className="flex gap-4">
         <UpstreamColumn
@@ -289,11 +307,15 @@ export function ApiAccessPage() {
                         expandedId === endpoint.id ? null : endpoint.id,
                       )
                     }
-                    onToggleEnabled={(enabled) =>
+                    onToggleEnabled={(enabled) => {
+                      if (enabled && endpoint.enabledKeyCount === 0) {
+                        toast.error(t("apiAccess.toast.enableNeedsKey"));
+                        return;
+                      }
                       setEndpointEnabled
                         .mutateAsync({ endpointId: endpoint.id, enabled })
-                        .catch(reportFailure)
-                    }
+                        .catch(reportFailure);
+                    }}
                     onEdit={() => {
                       setEditing(endpoint);
                       setFormOpen(true);
@@ -304,6 +326,9 @@ export function ApiAccessPage() {
                     onToggleKeyEnabled={(key, enabled) =>
                       setKeyEnabled
                         .mutateAsync({ keyId: key.id, enabled })
+                        .then((outcome) =>
+                          reportAutoDisabled(outcome.endpointAutoDisabled),
+                        )
                         .catch(reportFailure)
                     }
                     onClearKeyPenalty={(key) =>

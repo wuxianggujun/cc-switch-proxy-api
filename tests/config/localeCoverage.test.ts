@@ -53,6 +53,43 @@ const locales = [
 ] as const;
 
 describe("locale coverage", () => {
+  it.each(locales)(
+    "covers request trace strings and variables in %s",
+    (_name, tree) => {
+      const translations = flattenStrings(tree.requestLogs);
+      for (const [key, expected] of flattenStrings(en.requestLogs)) {
+        const actual = translations.get(key);
+        expect(actual, key).toBeDefined();
+        expect(interpolationVariables(actual ?? ""), key).toEqual(
+          interpolationVariables(expected),
+        );
+      }
+      expect(tree.nav.requestLogs).toBeTruthy();
+    },
+  );
+  it.each(locales)(
+    "covers check-in profile keys and variables in %s",
+    (_name, tree) => {
+      const translations = flattenStrings(tree.checkin as TranslationTree);
+      for (const [key, expected] of flattenStrings(
+        en.checkin as TranslationTree,
+      )) {
+        const actual = translations.get(key);
+        expect(actual, key).toBeDefined();
+        expect(interpolationVariables(actual ?? ""), key).toEqual(
+          interpolationVariables(expected),
+        );
+      }
+    },
+  );
+  it.each([["en", en], ...locales] as const)(
+    "explains Cloudflare verification and account Cookie authentication in %s",
+    (_name, tree) => {
+      expect(tree.checkin.form.browserHint).toContain("Cloudflare");
+      expect(tree.checkin.form.browserHint).toContain("Cookie");
+    },
+  );
+
   it.each(locales)("covers every Pi translation key in %s", (_name, tree) => {
     const translations = flattenStrings(tree as TranslationTree);
     const missing = [...piReference.keys()].filter(

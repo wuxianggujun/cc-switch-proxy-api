@@ -1,7 +1,8 @@
 //! 公益站签到命令：参数接收与应用服务转发。
 
 use crate::services::checkin::{
-    executor, CheckinConfig, CheckinResult, CheckinService, CheckinSite,
+    executor, CheckinBrowserSessionStatus, CheckinConfig, CheckinResult, CheckinService,
+    CheckinSite,
 };
 use crate::store::AppState;
 use tauri::{AppHandle, State};
@@ -12,16 +13,21 @@ pub fn get_checkin_config(state: State<'_, AppState>) -> Result<CheckinConfig, S
 }
 
 #[tauri::command]
-pub fn upsert_checkin_site(
+pub async fn upsert_checkin_site(
+    app: AppHandle,
     state: State<'_, AppState>,
     site: CheckinSite,
 ) -> Result<CheckinSite, String> {
-    CheckinService::upsert_site(state.inner(), site).map_err(|error| error.to_string())
+    executor::upsert_site(&app, state.inner(), site).await
 }
 
 #[tauri::command]
-pub fn delete_checkin_site(state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    CheckinService::delete_site(state.inner(), &id).map_err(|error| error.to_string())
+pub async fn delete_checkin_site(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    executor::delete_site(&app, state.inner(), &id).await
 }
 
 #[tauri::command]
@@ -58,4 +64,22 @@ pub async fn refresh_checkin_clearance(
     id: String,
 ) -> Result<(), String> {
     executor::refresh_clearance(&app, state.inner(), &id).await
+}
+
+#[tauri::command]
+pub async fn open_checkin_login_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    executor::open_login(&app, state.inner(), &id).await
+}
+
+#[tauri::command]
+pub async fn get_checkin_browser_session_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<CheckinBrowserSessionStatus, String> {
+    executor::browser_session_status(&app, state.inner(), &id).await
 }

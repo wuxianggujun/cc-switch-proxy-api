@@ -280,14 +280,8 @@ export function UsageDashboard({
       transition={{ duration: 0.4 }}
       className="space-y-8 pb-8"
     >
-      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 mb-2">
-        <div className="flex flex-col gap-1">
-          <h2 className="text-2xl font-bold tracking-tight">
-            {t("usage.title")}
-          </h2>
-          <p className="text-sm text-muted-foreground">{t("usage.subtitle")}</p>
-        </div>
-
+      {/* 标题由挂载页提供（请求与用量页），此处只保留筛选与刷新控制。 */}
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-2">
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center p-1 bg-muted/30 rounded-lg border border-border/50">
             {APP_FILTER_OPTIONS.map((type) => {

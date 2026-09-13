@@ -97,8 +97,16 @@ export function EndpointRow({
               ? t("apiAccess.modelCount", { count: endpoint.models.length })
               : t("apiAccess.modelAny")}
             {" · "}
-            {t("apiAccess.keyCount", { count: endpoint.keyCount })}
+            {t("apiAccess.enabledKeyCount", {
+              enabled: endpoint.enabledKeyCount,
+              total: endpoint.keyCount,
+            })}
           </p>
+          {endpoint.enabledKeyCount === 0 && (
+            <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+              {t("apiAccess.incomplete")}
+            </p>
+          )}
         </button>
 
         <div className="flex shrink-0 items-center gap-2">
@@ -153,7 +161,7 @@ export function EndpointRow({
                     key={key.id}
                     className="flex items-center gap-3 py-2 text-xs"
                   >
-                    <span className="font-mono">sk-••••{key.keyLast4}</span>
+                    <span className="font-mono">••••{key.keyLast4}</span>
                     {key.name && (
                       <span className="truncate text-muted-foreground">
                         {key.name}

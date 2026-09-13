@@ -16,7 +16,7 @@ use crate::proxy::{
 use axum::http::HeaderMap;
 use std::time::Instant;
 
-/// app_type → 网关上游类型。
+/// app_type → 该入口的**自己协议族**（同族上游类型）。
 ///
 /// 本轮覆盖 Claude/Codex/Gemini 入口。其它应用的专有命名空间沿用原有
 /// provider/账号绑定逻辑；它们也可能支持 API Key，但不能据此直接混用
@@ -32,6 +32,18 @@ fn gateway_upstreams_for(app_type: &AppType) -> &'static [UpstreamType] {
         AppType::Gemini => &[UpstreamType::Gemini],
         _ => &[],
     }
+}
+
+/// 该入口是否允许并入**其它协议族**里显式白名单命中本次 model 的接入点。
+///
+/// 目的：一个本机网关地址，按请求体里的 `model` 跨协议族选供应商。
+///
+/// 只放开 Claude 与 Codex：它们的 model 来自请求体，且转发链已能按
+/// `upstream_type` 做协议转换。Gemini 本轮不并入——它的 model 来自 URI，
+/// 且原生协议与另两族差异更大，留待单独验证。其余应用是独立命名空间与
+/// 鉴权，不能混用。
+fn gateway_cross_family_allowed(app_type: &AppType) -> bool {
+    matches!(app_type, AppType::Claude | AppType::Codex)
 }
 
 /// 查网关候选并合成为 Provider 列表。
@@ -54,7 +66,7 @@ fn select_gateway_providers(
     let model = (request_model != "unknown").then_some(request_model);
     let candidates = state
         .db
-        .reserve_route_candidates(upstreams, model)
+        .reserve_route_candidates(upstreams, model, gateway_cross_family_allowed(app_type))
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
     candidates
         .map(|routes| {
@@ -146,6 +158,11 @@ impl RequestContext {
         tag: &'static str,
         app_type_str: &'static str,
     ) -> Result<Self, ProxyError> {
+        if !body.is_object() {
+            return Err(ProxyError::InvalidRequest(
+                "Request body must be a JSON object".into(),
+            ));
+        }
         let start_time = Instant::now();
 
         // 从数据库读取应用级代理配置（per-app）
@@ -334,7 +351,7 @@ impl RequestContext {
         }
     }
 
-    fn routing_retry_enabled(&self) -> bool {
+    pub(crate) fn routing_retry_enabled(&self) -> bool {
         self.app_config.auto_failover_enabled || is_gateway_provider(&self.provider)
     }
 }

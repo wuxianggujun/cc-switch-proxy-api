@@ -51,13 +51,16 @@ fn endpoint(
 }
 
 fn key(db: &Database, endpoint_id: &str, secret: &str, priority: i64) -> String {
-    db.create_api_key(&NewApiKey {
-        endpoint_id: endpoint_id.into(),
-        api_key: secret.into(),
-        name: None,
-        internal_priority: priority,
-    })
-    .unwrap()
+    let id = db
+        .create_api_key(&NewApiKey {
+            endpoint_id: endpoint_id.into(),
+            api_key: secret.into(),
+            name: None,
+            internal_priority: priority,
+        })
+        .unwrap();
+    db.set_api_endpoint_enabled(endpoint_id, true).unwrap();
+    id
 }
 
 async fn gateway(db: Arc<Database>, app: &str) -> (ProxyServer, String) {
@@ -90,6 +93,71 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_custom_tools_keep_opaque_input_and_result_identity() {
+    const INPUT: &str = r#"{"input":"原始 JSON 工具文本"}"#;
+    for protocol in [UpstreamType::Claude, UpstreamType::Codex] {
+        let observed = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let calls = observed.clone();
+        let upstream=Upstream::start(Router::new().route(protocol_path(protocol),post(move |Json(body):Json<Value>| {
+            let first={let mut calls=calls.lock().unwrap();calls.push(body);calls.len()==1};
+            async move {Json(if !first {protocol_json(protocol)} else if protocol==UpstreamType::Claude {
+                json!({"id":"msg_custom","type":"message","model":"test-model","role":"assistant","content":[{
+                    "type":"tool_use","id":"call_custom","name":"raw_tool","input":{"input":INPUT}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":2}})
+            } else {json!({"id":"resp_custom","object":"response","model":"test-model","status":"completed","output":[{
+                "type":"custom_tool_call","call_id":"call_custom","name":"raw_tool","input":INPUT}]})})}
+        }))).await;
+        let db = Arc::new(Database::memory().unwrap());
+        let ep = endpoint(&db, protocol, &upstream.url, vec!["test-model".into()], 100);
+        key(&db, &ep, "sk-custom", 50);
+        let (server, url) = gateway(db, "codex").await;
+        let mut request = json!({"model":"test-model","messages":[{"role":"user","content":"执行工具"}],
+            "tools":[{"type":"custom","custom":{"name":"raw_tool","format":{"type":"text"}}}]});
+        let response = client()
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let reply: Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{protocol:?}: {reply}");
+        let message = &reply["choices"][0]["message"];
+        assert_eq!(
+            message["tool_calls"][0]["type"], "custom",
+            "{protocol:?}: {reply}"
+        );
+        assert_eq!(
+            message["tool_calls"][0]["custom"]["input"], INPUT,
+            "{protocol:?}: {reply}"
+        );
+        request["messages"] = json!([{"role":"user","content":"执行工具"},message,{"role":"tool","tool_call_id":"call_custom","content":"完成"}]);
+        let response = client()
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{protocol:?}: {text}");
+        let calls = observed.lock().unwrap();
+        if protocol == UpstreamType::Codex {
+            assert!(calls[1]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "custom_tool_call_output"
+                    && item["call_id"] == "call_custom"));
+        } else {
+            assert!(calls[1].to_string().contains("完成"));
+        }
+        drop(calls);
+        server.stop().await.unwrap();
+    }
+}
+
 fn claude_success() -> Value {
     json!({"id":"msg_test", "type":"message", "role":"assistant", "model":"claude-test",
         "content":[{"type":"text", "text":"pong"}], "stop_reason":"end_turn",
@@ -102,6 +170,76 @@ fn chat_success() -> Value {
         "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})
 }
 
+fn responses_success() -> Value {
+    json!({"id":"resp_test","object":"response","created_at":1,"model":"test-model",
+        "status":"completed","output":[{"id":"msg_test","type":"message","role":"assistant",
+            "status":"completed","content":[{"type":"output_text","text":"pong","annotations":[]}]}],
+        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}})
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_chat_entry_returns_chat_for_every_upstream_protocol() {
+    for protocol in [
+        UpstreamType::Claude,
+        UpstreamType::Codex,
+        UpstreamType::Openai,
+    ] {
+        let path = match protocol {
+            UpstreamType::Claude => "/v1/messages",
+            UpstreamType::Codex => "/v1/responses",
+            _ => "/v1/chat/completions",
+        };
+        let observed = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let calls = observed.clone();
+        let upstream = Upstream::start(Router::new().route(
+            path,
+            post(move |Json(body): Json<Value>| {
+                calls.lock().unwrap().push(body);
+                async move {
+                    Json(match protocol {
+                        UpstreamType::Claude => claude_success(),
+                        UpstreamType::Codex => responses_success(),
+                        _ => chat_success(),
+                    })
+                }
+            }),
+        ))
+        .await;
+        let db = Arc::new(Database::memory().unwrap());
+        let ep = endpoint(&db, protocol, &upstream.url, vec!["test-model".into()], 100);
+        key(&db, &ep, "sk-fixture", 50);
+        let (server, url) = gateway(db, "codex").await;
+        let response = client()
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&json!({
+                "model":"test-model", "messages":[{"role":"system","content":"保留系统提示词"},
+                    {"role":"user","content":"原始中文提示词"}], "max_tokens":64, "stream":false
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        server.stop().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{protocol:?}: {text}");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["object"], "chat.completion", "{protocol:?}: {text}");
+        assert_eq!(value["choices"][0]["message"]["content"], "pong");
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        let calls = observed.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].to_string().contains("原始中文提示词"));
+        assert!(calls[0].to_string().contains("保留系统提示词"));
+        if protocol == UpstreamType::Codex {
+            assert!(calls[0]["input"].is_array());
+            assert!(calls[0].get("messages").is_none());
+        } else {
+            assert!(calls[0]["messages"].is_array());
+        }
+    }
+}
+
 fn credential(headers: &HeaderMap) -> String {
     headers
         .get("authorization")
@@ -111,6 +249,649 @@ fn credential(headers: &HeaderMap) -> String {
         .unwrap_or("")
         .trim_start_matches("Bearer ")
         .into()
+}
+
+fn protocol_path(protocol: UpstreamType) -> &'static str {
+    match protocol {
+        UpstreamType::Claude => "/v1/messages",
+        UpstreamType::Codex => "/v1/responses",
+        _ => "/v1/chat/completions",
+    }
+}
+
+fn protocol_json(protocol: UpstreamType) -> Value {
+    match protocol {
+        UpstreamType::Claude => claude_success(),
+        UpstreamType::Codex => responses_success(),
+        _ => chat_success(),
+    }
+}
+
+fn protocol_sse(protocol: UpstreamType) -> String {
+    let events = match protocol {
+        UpstreamType::Claude => vec![
+            json!({"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"test-model","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        ],
+        UpstreamType::Codex => {
+            let mut response = responses_success();
+            response["output"][0]["content"][0]["text"] = json!("你好");
+            vec![
+                json!({"type":"response.created","response":{"id":"resp_test","model":"test-model","status":"in_progress","output":[]}}),
+                json!({"type":"response.output_text.delta","item_id":"msg_test","delta":"你好"}),
+                json!({"type":"response.completed","response":response}),
+            ]
+        }
+        _ => vec![
+            json!({"id":"chat_test","object":"chat.completion.chunk","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"你好"},"finish_reason":null}]}),
+            json!({"id":"chat_test","object":"chat.completion.chunk","model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}),
+        ],
+    };
+    let mut text = events
+        .into_iter()
+        .map(|event| match event.get("type").and_then(Value::as_str) {
+            Some(kind) => format!("event: {kind}\ndata: {event}\n\n"),
+            None => format!("data: {event}\n\n"),
+        })
+        .collect::<String>();
+    if !matches!(protocol, UpstreamType::Claude | UpstreamType::Codex) {
+        text.push_str("data: [DONE]\n\n");
+    }
+    text
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_three_protocol_matrix_preserves_json_sse_and_native_auth() {
+    for upstream_protocol in [
+        UpstreamType::Claude,
+        UpstreamType::Codex,
+        UpstreamType::Openai,
+    ] {
+        let observed = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let calls = observed.clone();
+        let upstream = Upstream::start(Router::new().route(
+            protocol_path(upstream_protocol),
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let streaming = body["stream"].as_bool().unwrap_or(false);
+                calls.lock().unwrap().push((headers, body));
+                async move {
+                    if streaming {
+                        let chunks = protocol_sse(upstream_protocol)
+                            .into_bytes()
+                            .chunks(5)
+                            .map(|bytes| {
+                                Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(bytes))
+                            })
+                            .collect::<Vec<_>>();
+                        (
+                            [
+                                ("content-type", "text/event-stream"),
+                                ("x-upstream-fixture", "matrix"),
+                            ],
+                            axum::body::Body::from_stream(futures::stream::iter(chunks)),
+                        )
+                            .into_response()
+                    } else {
+                        Json(protocol_json(upstream_protocol)).into_response()
+                    }
+                }
+            }),
+        ))
+        .await;
+        for entry in [
+            UpstreamType::Claude,
+            UpstreamType::Codex,
+            UpstreamType::Openai,
+        ] {
+            let db = Arc::new(Database::memory().unwrap());
+            let ep = endpoint(
+                &db,
+                upstream_protocol,
+                &upstream.url,
+                vec!["test-model".into()],
+                100,
+            );
+            key(&db, &ep, "sk-matrix", 50);
+            let (server, url) = gateway(
+                db,
+                if entry == UpstreamType::Claude {
+                    "claude"
+                } else {
+                    "codex"
+                },
+            )
+            .await;
+            for streaming in [false, true] {
+                let mut body = if entry == UpstreamType::Codex {
+                    json!({"input":"原始中文提示词"})
+                } else {
+                    json!({"messages":[{"role":"user","content":"原始中文提示词"}]})
+                };
+                body["model"] = json!("test-model");
+                body["stream"] = json!(streaming);
+                if entry == UpstreamType::Claude {
+                    body["max_tokens"] = json!(64);
+                }
+                let response = client()
+                    .post(format!("{url}{}", protocol_path(entry)))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let text = response.text().await.unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{entry:?}->{upstream_protocol:?} stream={streaming}: {text}"
+                );
+                if streaming {
+                    assert!(
+                        text.contains("你好"),
+                        "{entry:?}->{upstream_protocol:?}: {text}"
+                    );
+                    let marker = match entry {
+                        UpstreamType::Claude => "message_stop",
+                        UpstreamType::Codex => "response.completed",
+                        _ => "[DONE]",
+                    };
+                    assert!(
+                        text.contains(marker),
+                        "{entry:?}->{upstream_protocol:?}: {text}"
+                    );
+                    if entry == UpstreamType::Openai {
+                        assert!(!text.contains("event: message_start"));
+                        assert!(!text.contains("event: response.completed"));
+                    }
+                } else {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    match entry {
+                        UpstreamType::Claude => assert_eq!(value["type"], "message"),
+                        UpstreamType::Codex => assert_eq!(value["object"], "response"),
+                        _ => assert_eq!(value["object"], "chat.completion"),
+                    }
+                    assert!(text.contains("pong"));
+                }
+            }
+            server.stop().await.unwrap();
+        }
+        let calls = observed.lock().unwrap();
+        assert_eq!(calls.len(), 6);
+        for (headers, body) in calls.iter() {
+            if upstream_protocol == UpstreamType::Claude {
+                assert_eq!(headers.get("x-api-key").unwrap(), "sk-matrix");
+                assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+            } else {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-matrix");
+            }
+            assert!(body.to_string().contains("原始中文提示词"));
+        }
+    }
+}
+
+async fn completed_trace(db: &Database, id: &str) -> crate::database::RequestTraceDetail {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(detail) = db.get_request_trace(id).unwrap() {
+                if detail.summary.state != "in_progress" {
+                    break detail;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("trace must finish after response body is consumed")
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_request_trace_records_real_ip_raw_body_retries_and_redacted_errors() {
+    let upstream=Upstream::start(Router::new().route("/v1/chat/completions",post(|headers:HeaderMap|async move {
+        if credential(&headers)=="sk-invalid-sensitive" {
+            (StatusCode::UNAUTHORIZED,Json(json!({"error":{"message":"invalid key sk-invalid-sensitive","code":"bad_key"}}))).into_response()
+        } else {Json(chat_success()).into_response()}
+    }))).await;
+    let db = Arc::new(Database::memory().unwrap());
+    let ep = endpoint(&db, UpstreamType::Openai, &upstream.url, vec![], 100);
+    key(&db, &ep, "sk-invalid-sensitive", 1);
+    key(&db, &ep, "sk-working-sensitive", 2);
+    let (server, url) = gateway(db.clone(), "codex").await;
+    let original="{\n  \"model\": \"test-model\", \"messages\": [{\"role\":\"user\",\"content\":\"精确保留中文提示词\"}]\n}";
+    let response = client()
+        .post(format!(
+            "{url}/v1/chat/completions?api_key=client-query-secret"
+        ))
+        .header("authorization", "Bearer client-sensitive-token")
+        .header("x-forwarded-for", "203.0.113.99")
+        .header("content-type", "application/json")
+        .body(original)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = response.headers()["x-ccswitch-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    response.bytes().await.unwrap();
+    let detail = completed_trace(&db, &id).await;
+    assert_eq!(detail.summary.client_ip, "127.0.0.1");
+    assert_eq!(detail.summary.state, "completed");
+    assert_eq!(detail.summary.attempt_count, 2);
+    assert_eq!(detail.request.body, original);
+    assert_eq!(detail.attempts[0].status_code, Some(401));
+    assert!(detail.attempts[0]
+        .response
+        .as_ref()
+        .unwrap()
+        .body
+        .contains("[REDACTED]"));
+    assert_eq!(detail.attempts[1].status_code, Some(200));
+    let outbound: Value = serde_json::from_str(&detail.attempts[1].request.body).unwrap();
+    assert_eq!(outbound["messages"][0]["content"], "精确保留中文提示词");
+    assert!(detail.response.as_ref().unwrap().body.contains("pong"));
+    let json = serde_json::to_string(&detail).unwrap();
+    for secret in [
+        "client-sensitive-token",
+        "sk-invalid-sensitive",
+        "sk-working-sensitive",
+        "client-query-secret",
+    ] {
+        assert!(!json.contains(secret), "trace leaked {secret}");
+    }
+    assert!(
+        json.contains("203.0.113.99"),
+        "untrusted forwarded header should remain inspectable"
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_request_trace_includes_pre_route_errors_and_can_be_disabled() {
+    let db = Arc::new(Database::memory().unwrap());
+    let (server, url) = gateway(db.clone(), "codex").await;
+    let response = client()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body("{invalid 中文")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let id = response.headers()["x-ccswitch-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    response.bytes().await.unwrap();
+    let detail = completed_trace(&db, &id).await;
+    assert_eq!(detail.summary.state, "error");
+    assert!(detail.attempts.is_empty());
+    assert_eq!(detail.request.body, "{invalid 中文");
+    db.set_request_trace_config(&crate::database::RequestTraceConfig {
+        enabled: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let response = client()
+        .post(format!("{url}/v1/chat/completions"))
+        .json(&json!({"model":"missing","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.headers().contains_key("x-ccswitch-request-id"));
+    response.bytes().await.unwrap();
+    assert_eq!(
+        db.list_request_traces(&Default::default(), 0, 20)
+            .unwrap()
+            .total,
+        1
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_full_endpoint_urls_and_prefixed_entries_do_not_duplicate_paths() {
+    for protocol in [
+        UpstreamType::Claude,
+        UpstreamType::Openai,
+        UpstreamType::Codex,
+    ] {
+        let upstream = Upstream::start(Router::new().route(
+            protocol_path(protocol),
+            post(move || async move { Json(protocol_json(protocol)) }),
+        ))
+        .await;
+        let db = Arc::new(Database::memory().unwrap());
+        let ep = endpoint(
+            &db,
+            protocol,
+            &format!("{}{}", upstream.url, protocol_path(protocol)),
+            vec!["test-model".into()],
+            100,
+        );
+        key(&db, &ep, "sk-full-url", 50);
+        let (server, url) = gateway(
+            db,
+            if protocol == UpstreamType::Claude {
+                "claude"
+            } else {
+                "codex"
+            },
+        )
+        .await;
+        let (path, body) = match protocol {
+            UpstreamType::Claude => (
+                "/claude/v1/messages",
+                json!({"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":64}),
+            ),
+            UpstreamType::Codex => (
+                "/codex/v1/responses",
+                json!({"model":"test-model","input":"hi"}),
+            ),
+            _ => (
+                "/codex/v1/chat/completions",
+                json!({"model":"test-model","messages":[{"role":"user","content":"hi"}]}),
+            ),
+        };
+        let response = client()
+            .post(format!("{url}{path}?client=1"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{protocol:?}: {text}");
+        assert!(text.contains("pong"));
+        server.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_models_returns_standard_list_and_keeps_codex_catalog_shape() {
+    let db = Arc::new(Database::memory().unwrap());
+    let claude_endpoint = endpoint(
+        &db,
+        UpstreamType::Claude,
+        "http://127.0.0.1",
+        vec!["claude-test".into(), "claude-*".into()],
+        100,
+    );
+    key(&db, &claude_endpoint, "sk-claude-models", 50);
+    let openai_endpoint = endpoint(
+        &db,
+        UpstreamType::Openai,
+        "http://127.0.0.1",
+        vec!["gpt-test".into()],
+        100,
+    );
+    key(&db, &openai_endpoint, "sk-openai-models", 50);
+    let (server, url) = gateway(db, "codex").await;
+    let response: Value = client()
+        .get(format!("{url}/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["object"], "list");
+    assert!(response["models"].is_array());
+    let ids = response["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"claude-test"));
+    assert!(ids.contains(&"gpt-test"));
+    assert!(!ids.contains(&"claude-*"));
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_chat_handles_json_stream_fallback_and_usage_option() {
+    for content_type in ["application/json", "application/octet-stream"] {
+        let upstream = Upstream::start(Router::new().route(
+            "/v1/responses",
+            post(move || async move {
+                (
+                    [("content-type", content_type)],
+                    responses_success().to_string(),
+                )
+            }),
+        ))
+        .await;
+        let db = Arc::new(Database::memory().unwrap());
+        let ep = endpoint(&db, UpstreamType::Codex, &upstream.url, vec![], 100);
+        key(&db, &ep, "sk-json", 50);
+        let (server, url) = gateway(db, "codex").await;
+        for include_usage in [false, true] {
+            let response=client().post(format!("{url}/v1/chat/completions")).json(&json!({"model":"test-model",
+                "messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":include_usage}})).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = response.text().await.unwrap();
+            assert!(text.contains("pong"), "{content_type}: {text}");
+            assert!(text.contains("[DONE]"));
+            let events = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.get("usage").is_some())
+                    .count(),
+                usize::from(include_usage)
+            );
+            if include_usage {
+                assert_eq!(events.last().unwrap()["choices"], json!([]));
+            }
+        }
+        server.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_chat_reports_late_sse_error_without_success_or_retry() {
+    let events=concat!("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"部分中文\"}\n\n",
+        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"policy block sk-trace-secret\",\"code\":\"content_policy\"}}}\n\n");
+    let upstream = Upstream::start(Router::new().route(
+        "/v1/responses",
+        post(move || async move { ([("content-type", "text/event-stream")], events) }),
+    ))
+    .await;
+    let db = Arc::new(Database::memory().unwrap());
+    let ep = endpoint(&db, UpstreamType::Codex, &upstream.url, vec![], 100);
+    key(&db, &ep, "sk-trace-secret", 50);
+    let (server, url) = gateway(db.clone(), "codex").await;
+    let response=client().post(format!("{url}/v1/chat/completions")).json(&json!({"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = response.headers()["x-ccswitch-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let text = response.text().await.unwrap();
+    assert!(text.contains("部分中文"));
+    assert!(text.contains("event: error"));
+    assert!(!text.contains("\"finish_reason\":\"stop\""));
+    let detail = completed_trace(&db, &id).await;
+    assert_eq!(detail.summary.state, "error");
+    assert_eq!(detail.summary.attempt_count, 1);
+    assert!(detail.error.unwrap().contains("policy block [REDACTED]"));
+    assert!(!serde_json::to_string(&detail.attempts)
+        .unwrap()
+        .contains("sk-trace-secret"));
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_gzip_claude_request_is_forwarded_and_logged_as_utf8() {
+    use std::io::Write;
+    let seen = Arc::new(Mutex::new(None::<Value>));
+    let calls = seen.clone();
+    let upstream = Upstream::start(Router::new().route(
+        "/v1/messages",
+        post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            assert!(!headers.contains_key("content-encoding"));
+            *calls.lock().unwrap() = Some(body);
+            async { Json(claude_success()) }
+        }),
+    ))
+    .await;
+    let db = Arc::new(Database::memory().unwrap());
+    let ep = endpoint(&db, UpstreamType::Claude, &upstream.url, vec![], 100);
+    key(&db, &ep, "sk-gzip", 50);
+    let (server, url) = gateway(db.clone(), "claude").await;
+    let body=json!({"model":"test-model","messages":[{"role":"user","content":"压缩中文提示词"}],"max_tokens":64}).to_string();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body.as_bytes()).unwrap();
+    let response = client()
+        .post(format!("{url}/claude/v1/messages"))
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(encoder.finish().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = response.headers()["x-ccswitch-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    response.bytes().await.unwrap();
+    assert!(seen
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .to_string()
+        .contains("压缩中文提示词"));
+    assert_eq!(completed_trace(&db, &id).await.request.body, body);
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn gateway_http_tool_calls_and_results_round_trip_across_all_protocol_pairs() {
+    for upstream_protocol in [
+        UpstreamType::Claude,
+        UpstreamType::Codex,
+        UpstreamType::Openai,
+    ] {
+        for entry in [
+            UpstreamType::Claude,
+            UpstreamType::Codex,
+            UpstreamType::Openai,
+        ] {
+            let observed = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let calls = observed.clone();
+            let upstream=Upstream::start(Router::new().route(protocol_path(upstream_protocol),post(move |Json(body):Json<Value>| {
+                let first={let mut calls=calls.lock().unwrap();calls.push(body);calls.len()==1};
+                async move {Json(if !first {protocol_json(upstream_protocol)} else {match upstream_protocol {
+                    UpstreamType::Claude=>json!({"id":"msg_tool","type":"message","role":"assistant","model":"test-model","content":[{"type":"tool_use","id":"call_demo","name":"lookup","input":{"q":"中文"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":2}}),
+                    UpstreamType::Codex=>json!({"id":"resp_tool","object":"response","status":"completed","model":"test-model","output":[{"type":"function_call","id":"fc_demo","call_id":"call_demo","name":"lookup","arguments":"{\"q\":\"中文\"}"}],"usage":{"input_tokens":1,"output_tokens":2}}),
+                    _=>json!({"id":"chat_tool","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_demo","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"中文\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2}})
+                }})}
+            }))).await;
+            let db = Arc::new(Database::memory().unwrap());
+            let ep = endpoint(
+                &db,
+                upstream_protocol,
+                &upstream.url,
+                vec!["test-model".into()],
+                100,
+            );
+            key(&db, &ep, "sk-tools", 50);
+            let (server, url) = gateway(
+                db,
+                if entry == UpstreamType::Claude {
+                    "claude"
+                } else {
+                    "codex"
+                },
+            )
+            .await;
+            let schema =
+                json!({"type":"object","properties":{"q":{"type":"string"}},"required":["q"]});
+            let mut request = match entry {
+                UpstreamType::Claude => {
+                    json!({"messages":[{"role":"user","content":"查找"}],"max_tokens":64,"tools":[{"name":"lookup","input_schema":schema}]})
+                }
+                UpstreamType::Codex => {
+                    json!({"input":"查找","tools":[{"type":"function","name":"lookup","parameters":schema}]})
+                }
+                _ => {
+                    json!({"messages":[{"role":"user","content":"查找"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":schema}}]})
+                }
+            };
+            request["model"] = json!("test-model");
+            let response = client()
+                .post(format!("{url}{}", protocol_path(entry)))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{entry:?}->{upstream_protocol:?}: {body}"
+            );
+            match entry {
+                UpstreamType::Claude => {
+                    request["messages"] = json!([{"role":"user","content":"查找"},{"role":"assistant","content":body["content"]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_demo","content":"真实工具结果"}]}])
+                }
+                UpstreamType::Codex => {
+                    let mut input = vec![json!({"role":"user","content":"查找"})];
+                    input.extend(body["output"].as_array().unwrap().clone());
+                    input.push(json!({"type":"function_call_output","call_id":"call_demo","output":"真实工具结果"}));
+                    request["input"] = json!(input);
+                }
+                _ => {
+                    request["messages"] = json!([{"role":"user","content":"查找"},body["choices"][0]["message"],{"role":"tool","tool_call_id":"call_demo","content":"真实工具结果"}])
+                }
+            }
+            let response = client()
+                .post(format!("{url}{}", protocol_path(entry)))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{entry:?}->{upstream_protocol:?}: {text}"
+            );
+            let calls = observed.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert!(
+                calls[1].to_string().contains("真实工具结果"),
+                "{entry:?}->{upstream_protocol:?}: {}",
+                calls[1]
+            );
+            assert!(calls[1].to_string().contains("call_demo"));
+            drop(calls);
+            server.stop().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]

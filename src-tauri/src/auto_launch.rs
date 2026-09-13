@@ -17,7 +17,9 @@ fn get_macos_app_bundle_path(exe_path: &std::path::Path) -> Option<std::path::Pa
 
 /// 初始化 AutoLaunch 实例
 fn get_auto_launch() -> Result<AutoLaunch, AppError> {
-    let app_name = "CC Switch";
+    // 独立于上游的自启项名：上游用 "CC Switch"，两者若同名会互相覆盖同一条
+    // 注册表/XDG autostart 记录。
+    let app_name = "CC Switch Proxy";
     let exe_path =
         std::env::current_exe().map_err(|e| AppError::Message(format!("无法获取应用路径: {e}")))?;
 

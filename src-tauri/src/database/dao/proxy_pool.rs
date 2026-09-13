@@ -77,7 +77,7 @@ impl Database {
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| row_to_subscription(row))
+            .query_map([], row_to_subscription)
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut out = Vec::new();
@@ -154,7 +154,7 @@ impl Database {
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| row_to_node_with_health(row))
+            .query_map([], row_to_node_with_health)
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut nodes = Vec::new();

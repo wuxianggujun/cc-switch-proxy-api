@@ -1,7 +1,7 @@
 //! Skills 服务层
 //!
 //! v3.10.0+ 统一管理架构：
-//! - SSOT（单一事实源）：`~/.cc-switch/skills/`
+//! - SSOT（单一事实源）：`~/.cc-switch-proxy/skills/`
 //! - 安装时下载到 SSOT，按需同步到各应用目录
 //! - 数据库存储安装记录和启用状态
 
@@ -65,7 +65,7 @@ pub enum SyncMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillStorageLocation {
-    /// CC Switch 管理目录 (~/.cc-switch/skills/)
+    /// CC Switch 管理目录 (~/.cc-switch-proxy/skills/)
     #[default]
     CcSwitch,
     /// Agent Skills 统一标准目录 (~/.agents/skills/)
@@ -545,7 +545,7 @@ impl SkillService {
 
     // ========== 路径管理 ==========
 
-    /// 获取 SSOT 目录（根据设置返回 ~/.cc-switch/skills/ 或 ~/.agents/skills/）
+    /// 获取 SSOT 目录（根据设置返回 ~/.cc-switch-proxy/skills/ 或 ~/.agents/skills/）
     pub fn get_ssot_dir() -> Result<PathBuf> {
         let location = crate::settings::get_skill_storage_location();
         let dir = match location {
@@ -5415,7 +5415,7 @@ mod tests {
         let _guard = TestHomeGuard::set(temp.path());
 
         // 手工放置一个备份：meta.json 里的 directory 指向 SSOT 之外。
-        // SSOT 位于 {home}/.cc-switch/skills，"../../pwned-restore" 若生效会写到 {home}/pwned-restore。
+        // SSOT 位于 {home}/.cc-switch-proxy-proxy/skills，"../../pwned-restore" 若生效会写到 {home}/pwned-restore。
         let backup_id = "20260727_120000_evil";
         let backup_dir = SkillService::get_backup_dir()
             .expect("backup dir")
@@ -5546,7 +5546,7 @@ mod tests {
             .expect("migrate away from alias");
         let new_source = temp
             .path()
-            .join(".cc-switch")
+            .join(".cc-switch-proxy")
             .join("skills")
             .join("test-skill");
         let pi_skill = temp
@@ -5571,7 +5571,7 @@ mod tests {
         let _guard = TestHomeGuard::set(temp.path());
 
         // 模拟同步导入灌进来的脏数据：directory 含路径穿越（save_skill 不校验，
-        // 与 import_sql_string_for_sync 的效果一致）。SSOT = {home}/.cc-switch/skills，
+        // 与 import_sql_string_for_sync 的效果一致）。SSOT = {home}/.cc-switch-proxy-proxy/skills，
         // "../../victim-uninstall" 解析为 {home}/victim-uninstall。
         let victim = temp.path().join("victim-uninstall");
         fs::create_dir_all(&victim).expect("create victim dir");
@@ -5658,8 +5658,11 @@ mod tests {
             .join("test-skill");
         fs::create_dir_all(pi_skill.parent().expect("Pi skills directory"))
             .expect("create Pi skills directory");
-        std::os::unix::fs::symlink(Path::new("../../.cc-switch/skills/test-skill"), &pi_skill)
-            .expect("create relative Pi symlink");
+        std::os::unix::fs::symlink(
+            Path::new("../../.cc-switch-proxy/skills/test-skill"),
+            &pi_skill,
+        )
+        .expect("create relative Pi symlink");
 
         let result = SkillService::migrate_storage(&db, SkillStorageLocation::Unified)
             .expect("migrate storage");

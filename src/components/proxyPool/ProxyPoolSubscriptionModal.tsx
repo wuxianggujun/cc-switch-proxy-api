@@ -107,7 +107,7 @@ export function ProxyPoolSubscriptionModal({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
           <div className="space-y-1.5">
             <Label htmlFor="pp-sub-name">{t("proxyPool.form.name")}</Label>
             <Input

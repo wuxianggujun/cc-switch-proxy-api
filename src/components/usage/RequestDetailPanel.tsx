@@ -45,7 +45,7 @@ export function RequestDetailPanel({
           <DialogHeader>
             <DialogTitle>{t("usage.requestDetail", "请求详情")}</DialogTitle>
           </DialogHeader>
-          <div className="text-center text-muted-foreground">
+          <div className="px-6 py-4 text-center text-muted-foreground">
             {t("usage.requestNotFound", "请求未找到")}
           </div>
         </DialogContent>
@@ -64,7 +64,7 @@ export function RequestDetailPanel({
           <DialogTitle>{t("usage.requestDetail", "请求详情")}</DialogTitle>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="space-y-4 px-6 py-4">
           {/* 基本信息 */}
           <div className="rounded-lg border p-4">
             <h3 className="mb-3 font-semibold">

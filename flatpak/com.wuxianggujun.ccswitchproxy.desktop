@@ -2,8 +2,8 @@
 Type=Application
 Name=CC Switch
 Comment=All-in-One Assistant for Claude Code, Codex & Gemini CLI
-Exec=cc-switch
-Icon=com.ccswitch.desktop
+Exec=cc-switch-proxy
+Icon=com.wuxianggujun.ccswitchproxy
 Terminal=false
 Categories=Utility;Development;
 StartupNotify=true

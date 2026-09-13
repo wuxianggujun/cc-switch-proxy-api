@@ -57,7 +57,11 @@ export function CheckinStatusBadge({ result }: { result?: CheckinResult }) {
       title={result.message || undefined}
     >
       <Icon className="h-3.5 w-3.5 shrink-0" />
-      {t(`checkin.status.${result.status}`)}
+      {t(
+        result.status === "failed" && result.needsLogin
+          ? "checkin.status.needsLogin"
+          : `checkin.status.${result.status}`,
+      )}
     </span>
   );
 }

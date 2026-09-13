@@ -24,6 +24,7 @@ export interface ApiEndpoint {
   notes?: string;
   createdAt: number;
   keyCount: number;
+  enabledKeyCount: number;
 }
 
 export interface NewApiEndpoint {
@@ -33,6 +34,44 @@ export interface NewApiEndpoint {
   models?: string[];
   priority?: number;
   notes?: string;
+}
+
+export interface NewApiKeyValue {
+  apiKey: string;
+  name?: string;
+  internalPriority?: number;
+}
+
+export interface NewApiEndpointWithKey {
+  endpoint: NewApiEndpoint;
+  firstKey: NewApiKeyValue;
+}
+
+export interface CreatedApiEndpoint {
+  endpointId: string;
+  keyId: string;
+}
+
+export interface UpdateApiEndpointInput extends NewApiEndpoint {
+  endpointId: string;
+  newKey?: NewApiKeyValue;
+}
+
+export interface UpdatedApiEndpoint {
+  endpointId: string;
+  keyId?: string;
+  rebound: boolean;
+}
+
+export interface KeyMutationOutcome {
+  endpointId: string;
+  endpointAutoDisabled: boolean;
+}
+
+export interface GatewayModelFetchDraft {
+  baseUrl: string;
+  apiKey: string;
+  upstreamType: UpstreamType;
 }
 
 /** 密钥记录。明文不下发，只有末四位。 */

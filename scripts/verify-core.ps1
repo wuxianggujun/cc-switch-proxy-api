@@ -28,9 +28,9 @@ try {
 
     $testArgs = @('--test-threads=1', '--format=terse')
     if (-not $Full) {
-        $testArgs += @('api_gateway', 'gateway_http', 'proxy_pool', 'checkin', 'explicit_test_home')
+        $testArgs += @('api_gateway', 'gateway_http', 'request_trace', 'chat_entry', 'proxy_pool', 'checkin', 'explicit_test_home')
     }
-    & cargo.exe test --manifest-path (Join-Path $repository 'src-tauri\Cargo.toml') --lib --locked --config 'profile.test.package.cc-switch.debug=0' -- @testArgs
+    & cargo.exe test --manifest-path (Join-Path $repository 'src-tauri\Cargo.toml') --lib --locked --config 'profile.test.package.cc-switch-proxy.debug=0' -- @testArgs
     if ($LASTEXITCODE -ne 0) { throw "Rust 测试失败，退出码 $LASTEXITCODE" }
 
     & pnpm.cmd typecheck
@@ -38,7 +38,7 @@ try {
     if ($Full) {
         & pnpm.cmd test:unit --maxWorkers=2 --minWorkers=1
     } else {
-        & pnpm.cmd test:unit tests/components/GatewayStatusBar.test.tsx tests/config/localeCoverage.test.ts --maxWorkers=2 --minWorkers=1
+        & pnpm.cmd test:unit tests/components/GatewayStatusBar.test.tsx tests/components/RequestLogsPage.test.tsx tests/components/requestTraceFormatting.test.ts tests/lib/requestTracesApi.test.ts tests/config/localeCoverage.test.ts --maxWorkers=2 --minWorkers=1
     }
     if ($LASTEXITCODE -ne 0) { throw "前端测试失败，退出码 $LASTEXITCODE" }
     Write-Host '验证通过。CC_SWITCH_TEST_HOME 已指定独立的测试配置目录。'

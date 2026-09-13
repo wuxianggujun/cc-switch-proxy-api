@@ -84,6 +84,7 @@ fn import_authorizer(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hoo
 
 /// Tables whose data rows are skipped when exporting for WebDAV sync.
 const SYNC_SKIP_TABLES: &[&str] = &[
+    "request_traces",
     "proxy_request_logs",
     "stream_check_logs",
     "provider_health",
@@ -96,6 +97,7 @@ const SYNC_SKIP_TABLES: &[&str] = &[
 /// Tables whose local data is preserved from the live database during WebDAV import.
 /// Excludes ephemeral tables like provider_health that can safely rebuild at runtime.
 const SYNC_PRESERVE_TABLES: &[&str] = &[
+    "request_traces",
     "proxy_request_logs",
     "stream_check_logs",
     "proxy_live_backup",
@@ -1199,7 +1201,7 @@ mod tests {
             // Prevent the Windows legacy-HOME fallback without mutating HOME:
             // an existing default DB keeps get_app_config_dir() anchored under
             // CC_SWITCH_TEST_HOME and makes import exercise its safety backup.
-            let config_dir = temp_dir.path().join(".cc-switch");
+            let config_dir = temp_dir.path().join(".cc-switch-proxy");
             std::fs::create_dir_all(&config_dir).expect("create isolated config directory");
             std::fs::File::create(config_dir.join("cc-switch.db"))
                 .expect("create isolated database sentinel");

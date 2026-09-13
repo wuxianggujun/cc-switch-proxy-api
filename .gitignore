@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.tmp/
 release/
 .DS_Store
 *.log
@@ -20,7 +21,7 @@ vitest-report.json
 nul
 
 # Flatpak build artifacts
-flatpak/cc-switch.deb
+flatpak/cc-switch-proxy.deb
 flatpak-build/
 flatpak-repo/
 .worktrees/

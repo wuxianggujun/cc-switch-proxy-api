@@ -6,6 +6,7 @@ import {
   CalendarCheck,
   Cpu,
   FolderOpen,
+  FileText,
   History,
   KeyRound,
   Layers,
@@ -22,6 +23,7 @@ import type { AppId } from "@/lib/api/types";
 export type NavViewId =
   | "home"
   | "apiAccess"
+  | "requestLogs"
   | "providers"
   | "skills"
   | "prompts"
@@ -48,6 +50,12 @@ export interface NavItem {
   apps?: AppId[];
   /** global 表示与应用无关，侧边栏里不展开应用子项。 */
   scope?: "global";
+  /**
+   * 归入供应商页顶部标签栏的视图：它们都依赖「当前是哪个供应商应用」，
+   * 拆在侧边栏里会让同一上下文的功能散落两处。
+   * 侧边栏只保留 providers 作为该组入口，其余成员不再单独列行。
+   */
+  group?: "providers";
 }
 
 const CLI_APPS: AppId[] = [
@@ -74,20 +82,45 @@ export const NAV_ITEMS: NavItem[] = [
     icon: Boxes,
     scope: "global",
   },
-  { id: "providers", labelKey: "nav.providers", icon: Server },
-  { id: "skills", labelKey: "nav.skills", icon: Wrench, apps: CLI_APPS },
-  { id: "prompts", labelKey: "nav.prompts", icon: Book, apps: CLI_APPS },
+  {
+    id: "providers",
+    labelKey: "nav.providers",
+    icon: Server,
+    group: "providers",
+  },
+  {
+    id: "requestLogs",
+    labelKey: "nav.requestLogs",
+    icon: FileText,
+    scope: "global",
+  },
+  {
+    id: "skills",
+    labelKey: "nav.skills",
+    icon: Wrench,
+    apps: CLI_APPS,
+    group: "providers",
+  },
+  {
+    id: "prompts",
+    labelKey: "nav.prompts",
+    icon: Book,
+    apps: CLI_APPS,
+    group: "providers",
+  },
   {
     id: "sessions",
     labelKey: "nav.sessions",
     icon: History,
     apps: [...CLI_APPS, "openclaw"],
+    group: "providers",
   },
   {
     id: "mcp",
     labelKey: "nav.mcp",
     icon: Layers,
     apps: ["claude", "codex", "gemini", "grokbuild", "opencode", "hermes"],
+    group: "providers",
   },
   {
     id: "workspace",
@@ -119,11 +152,14 @@ export const NAV_ITEMS: NavItem[] = [
     icon: Brain,
     apps: ["hermes"],
   },
+  // 统一供应商本身与具体 CLI 无关（scope: global），但它编辑的就是供应商，
+  // 放在供应商页标签栏里比单列一行更贴近使用场景。
   {
     id: "universal",
     labelKey: "nav.universal",
     icon: Layers,
     scope: "global",
+    group: "providers",
   },
   // 公益站账号与具体 CLI 无关（同一站常同时供 claude 和 codex），故为 global。
   {
@@ -141,6 +177,34 @@ export const NAV_ITEMS: NavItem[] = [
     scope: "global",
   },
 ];
+
+/** 供应商页标签栏的顺序；不在表里的组成员按 NAV_ITEMS 原序排在后面。 */
+const PROVIDER_TAB_ORDER: NavViewId[] = [
+  "providers",
+  "skills",
+  "prompts",
+  "sessions",
+  "mcp",
+  "universal",
+];
+
+export function isProviderTabView(view: NavViewId): boolean {
+  return NAV_ITEMS.some(
+    (item) => item.id === view && item.group === "providers",
+  );
+}
+
+/** 当前应用下可见的供应商页标签（已按 apps 过滤）。 */
+export function getProviderTabs(app: AppId): NavItem[] {
+  const rank = (id: NavViewId) => {
+    const index = PROVIDER_TAB_ORDER.indexOf(id);
+    return index === -1 ? Number.POSITIVE_INFINITY : index;
+  };
+  return NAV_ITEMS.filter(
+    (item) =>
+      item.group === "providers" && (!item.apps || item.apps.includes(app)),
+  ).sort((a, b) => rank(a.id) - rank(b.id));
+}
 
 export function isNavViewAvailable(view: NavViewId, app: AppId): boolean {
   const item = NAV_ITEMS.find((entry) => entry.id === view);

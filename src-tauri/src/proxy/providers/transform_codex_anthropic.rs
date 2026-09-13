@@ -379,6 +379,39 @@ pub fn responses_request_to_anthropic(
         result["stream"] = v.clone();
     }
 
+    // Chat entry normalization preserves options with Anthropic equivalents.
+    // Carry these explicitly instead of silently discarding caller constraints.
+    if let Some(stop) = body.get("stop").filter(|value| !value.is_null()) {
+        let sequences = match stop {
+            Value::String(text) => vec![json!(text)],
+            Value::Array(items) if items.iter().all(Value::is_string) => items.clone(),
+            _ => {
+                return Err(ProxyError::InvalidRequest(
+                    "stop must be a string or string array".into(),
+                ))
+            }
+        };
+        if !sequences.is_empty() {
+            result["stop_sequences"] = Value::Array(sequences);
+        }
+    }
+    if let Some(format) = body.pointer("/text/format") {
+        let schema = match format.get("type").and_then(Value::as_str) {
+            Some("json_schema") => format.get("schema").cloned(),
+            Some("json_object") => Some(json!({"type":"object"})),
+            _ => None,
+        };
+        if let Some(schema) = schema {
+            if result.get("output_config").is_none() {
+                result["output_config"] = json!({});
+            }
+            result["output_config"]["format"] = json!({"type":"json_schema","schema":schema});
+        }
+    }
+    if let Some(user) = body.get("user").and_then(Value::as_str) {
+        result["metadata"] = json!({"user_id":user});
+    }
+
     // Reuse the Codex tool context so function, namespace, custom, tool_search, and
     // dynamically loaded tools all receive stable flat names upstream.
     let anth_tools: Vec<Value> = tool_context
